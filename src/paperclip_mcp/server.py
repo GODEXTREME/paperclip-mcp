@@ -125,10 +125,6 @@ async def _patch(path: str, body: dict[str, Any]) -> Any:
     return await _request("PATCH", path, body=body)
 
 
-async def _delete(path: str) -> Any:
-    return await _request("DELETE", path)
-
-
 # ── Startup validation ─────────────────────────────────────────────────────────
 
 def _validate_config() -> None:
@@ -328,16 +324,6 @@ async def comment_on_issue(
     if reopen:
         payload["reopen"] = True
     return await _post(f"/issues/{issue_id}/comments", payload)
-
-
-@mcp.tool()
-async def delete_issue(issue_id: str) -> Any:
-    """Permanently delete an issue. This action cannot be undone.
-
-    Args:
-        issue_id: Issue UUID or identifier to delete.
-    """
-    return await _delete(f"/issues/{issue_id}")
 
 
 # ── AGENTS ─────────────────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ Exposes Paperclip's REST API as [Model Context Protocol](https://modelcontextpro
 
 | Category | Tools |
 |---|---|
-| **Issues** | `list_issues` · `get_issue` · `create_issue` · `update_issue` · `checkout_issue` · `release_issue` · `comment_on_issue` · `delete_issue` |
+| **Issues** | `list_issues` · `get_issue` · `create_issue` · `update_issue` · `checkout_issue` · `release_issue` · `comment_on_issue` |
 | **Agents** | `list_agents` · `get_agent` · `invoke_agent_heartbeat` |
 | **Goals** | `list_goals` · `create_goal` · `update_goal` |
 | **Approvals** | `list_approvals` · `approve` · `reject` · `request_approval_revision` |
