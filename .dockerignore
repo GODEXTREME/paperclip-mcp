@@ -1,0 +1,28 @@
+# Secrets — never bake credentials into the image
+.env
+.env.*
+
+# VCS and CI
+.git
+.github
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Not needed at runtime
+tests/
+docker-compose.yml
+Dockerfile
+.dockerignore
+README.md
