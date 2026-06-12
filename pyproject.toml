@@ -52,7 +52,9 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "ANN"]
-ignore = ["ANN101", "ANN102"]
+# ANN401: MCP tools return arbitrary JSON from the Paperclip API — Any is the
+# honest type for those returns.
+ignore = ["ANN401"]
 
 [tool.mypy]
 python_version = "3.10"

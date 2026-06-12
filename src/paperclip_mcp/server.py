@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
+import urllib.parse
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -70,6 +73,57 @@ def _err(message: str, status: int | None = None) -> dict[str, Any]:
     if status is not None:
         payload["status"] = status
     return payload
+
+
+# ── Parameter sanitization ─────────────────────────────────────────────────────
+#
+# Tool parameters are interpolated into URL paths. Every value MUST pass through
+# one of the helpers below before reaching an f-string, otherwise a crafted id
+# (e.g. "../companies/x" or "abc?admin=1") can rewrite the request path/query.
+
+_MAX_PARAM_LEN = 128
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_ISSUE_REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+ISSUE_STATUSES = {"todo", "in_progress", "blocked", "done", "cancelled"}
+ISSUE_PRIORITIES = {"urgent", "high", "medium", "low"}
+APPROVAL_STATUSES = {"pending", "approved", "rejected", "revision_requested"}
+
+
+def _path_param(value: str, name: str = "parameter") -> str:
+    """Validate and percent-encode a value destined for a URL path segment.
+
+    Raises ValueError if the value is empty, too long, or contains control
+    characters. The returned string is fully quoted (no characters are exempt),
+    so path separators, "?", "#", etc. cannot alter the request target.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty.")
+    if len(value) > _MAX_PARAM_LEN:
+        raise ValueError(f"{name} is too long (max {_MAX_PARAM_LEN} characters).")
+    if _CONTROL_CHARS_RE.search(value):
+        raise ValueError(f"{name} contains control characters.")
+    return urllib.parse.quote(value, safe="")
+
+
+def _uuid_param(value: str, name: str) -> str:
+    """Validate a parameter that is a UUID by contract; returns the canonical form."""
+    try:
+        return str(uuid.UUID(value.strip()))
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be a valid UUID.") from None
+
+
+def _issue_ref(value: str, name: str = "issue_id") -> str:
+    """Validate an issue reference: UUID or human-readable id like "CY-42"."""
+    value = value.strip()
+    if not _ISSUE_REF_RE.fullmatch(value):
+        raise ValueError(
+            f"{name} must be a UUID or an identifier like 'CY-42' "
+            "(letters, digits, '-' and '_', 1-64 chars)."
+        )
+    return _path_param(value, name)
 
 
 async def _request(
@@ -141,10 +195,18 @@ def _validate_config() -> None:
             "Or set them in your shell before starting the server."
         )
         sys.exit(1)
+    try:
+        _uuid_param(COMPANY, "PAPERCLIP_COMPANY_ID")
+    except ValueError:
+        log.error(
+            "PAPERCLIP_COMPANY_ID must be a UUID — find it in the Paperclip UI URL: "
+            "/companies/{uuid}."
+        )
+        sys.exit(1)
 
 
 @asynccontextmanager
-async def _lifespan(_server: FastMCP):  # type: ignore[type-arg]
+async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
     _validate_config()
     log.info("paperclip-mcp started — base: %s | company: %s", BASE_URL, COMPANY)
     yield
@@ -187,7 +249,14 @@ async def list_issues(
         label: Label name to filter by. Leave empty to skip label filtering.
         limit: Maximum number of results to return (1–200). Default: 50.
     """
-    params: dict[str, Any] = {"status": status, "limit": max(1, min(limit, 200))}
+    statuses = [s.strip() for s in status.split(",") if s.strip()]
+    invalid = sorted(set(statuses) - ISSUE_STATUSES)
+    if not statuses or invalid:
+        return _err(
+            f"Invalid status filter '{status}'. "
+            f"Allowed (comma-separated): {', '.join(sorted(ISSUE_STATUSES))}."
+        )
+    params: dict[str, Any] = {"status": ",".join(statuses), "limit": max(1, min(limit, 200))}
     if assignee_agent_id:
         params["assigneeAgentId"] = assignee_agent_id
     if project_id:
@@ -204,7 +273,11 @@ async def get_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or human-readable identifier (e.g. "CY-42").
     """
-    return await _get(f"/issues/{issue_id}")
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _get(f"/issues/{ref}")
 
 
 @mcp.tool()
@@ -225,7 +298,8 @@ async def create_issue(
         description: Full instructions or context for the agent (Markdown supported).
         assignee_agent_id: UUID of the agent to assign. Leave empty to leave unassigned.
         project_id: UUID of the project this issue belongs to. Leave empty for no project.
-        parent_issue_id: UUID of the parent issue when creating a subtask. Leave empty for top-level.
+        parent_issue_id: UUID of the parent issue when creating a subtask.
+                         Leave empty for top-level.
         priority: Task priority — urgent, high, medium, or low. Default: medium.
     """
     body: dict[str, Any] = {"title": title, "priority": priority}
@@ -260,24 +334,35 @@ async def update_issue(
         assignee_agent_id: New agent UUID. Leave empty to keep current assignee.
         priority: New priority — urgent, high, medium, or low. Leave empty to keep current.
     """
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if title:
         body["title"] = title
     if description:
         body["description"] = description
     if status:
-        if status not in {"todo", "in_progress", "blocked", "done", "cancelled"}:
-            return _err(f"Invalid status '{status}'. Allowed: todo, in_progress, blocked, done, cancelled.")
+        if status not in ISSUE_STATUSES:
+            return _err(
+                f"Invalid status '{status}'. Allowed: {', '.join(sorted(ISSUE_STATUSES))}."
+            )
         body["status"] = status
     if assignee_agent_id:
         body["assigneeAgentId"] = assignee_agent_id
     if priority:
-        if priority not in {"urgent", "high", "medium", "low"}:
-            return _err(f"Invalid priority '{priority}'. Allowed: urgent, high, medium, low.")
+        if priority not in ISSUE_PRIORITIES:
+            return _err(
+                f"Invalid priority '{priority}'. Allowed: {', '.join(sorted(ISSUE_PRIORITIES))}."
+            )
         body["priority"] = priority
     if not body:
-        return _err("No fields to update. Provide at least one of: title, description, status, assignee_agent_id, priority.")
-    return await _patch(f"/issues/{issue_id}", body)
+        return _err(
+            "No fields to update. Provide at least one of: "
+            "title, description, status, assignee_agent_id, priority."
+        )
+    return await _patch(f"/issues/{ref}", body)
 
 
 @mcp.tool()
@@ -290,7 +375,11 @@ async def checkout_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to check out.
     """
-    return await _post(f"/issues/{issue_id}/checkout")
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _post(f"/issues/{ref}/checkout")
 
 
 @mcp.tool()
@@ -303,7 +392,11 @@ async def release_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to release.
     """
-    return await _post(f"/issues/{issue_id}/release")
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _post(f"/issues/{ref}/release")
 
 
 @mcp.tool()
@@ -320,10 +413,14 @@ async def comment_on_issue(
         reopen: Set to true to reopen the issue when posting this comment.
                 Only effective if the issue is currently closed.
     """
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
     payload: dict[str, Any] = {"body": body}
     if reopen:
         payload["reopen"] = True
-    return await _post(f"/issues/{issue_id}/comments", payload)
+    return await _post(f"/issues/{ref}/comments", payload)
 
 
 # ── AGENTS ─────────────────────────────────────────────────────────────────────
@@ -342,8 +439,13 @@ async def get_agent(agent_id: str = "me") -> Any:
         agent_id: Agent UUID, or the literal string "me" to get the current agent identity.
                   Default: "me"
     """
-    path = "/agents/me" if agent_id.strip().lower() == "me" else f"/agents/{agent_id}"
-    return await _get(path)
+    if agent_id.strip().lower() == "me":
+        return await _get("/agents/me")
+    try:
+        ref = _uuid_param(agent_id, "agent_id")
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _get(f"/agents/{ref}")
 
 
 @mcp.tool()
@@ -356,7 +458,11 @@ async def invoke_agent_heartbeat(agent_id: str) -> Any:
     Args:
         agent_id: UUID of the agent to trigger.
     """
-    return await _post(f"/agents/{agent_id}/heartbeat/invoke")
+    try:
+        ref = _uuid_param(agent_id, "agent_id")
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _post(f"/agents/{ref}/heartbeat/invoke")
 
 
 # ── GOALS ──────────────────────────────────────────────────────────────────────
@@ -397,6 +503,10 @@ async def update_goal(
         title: New title. Leave empty to keep current.
         description: New description. Leave empty to keep current.
     """
+    try:
+        ref = _uuid_param(goal_id, "goal_id")
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if title:
         body["title"] = title
@@ -404,7 +514,7 @@ async def update_goal(
         body["description"] = description
     if not body:
         return _err("No fields to update. Provide at least one of: title, description.")
-    return await _patch(f"/goals/{goal_id}", body)
+    return await _patch(f"/goals/{ref}", body)
 
 
 # ── APPROVALS ──────────────────────────────────────────────────────────────────
@@ -418,9 +528,10 @@ async def list_approvals(status: str = "pending") -> Any:
                 pending, approved, rejected, revision_requested.
                 Default: "pending"
     """
-    allowed = {"pending", "approved", "rejected", "revision_requested"}
-    if status not in allowed:
-        return _err(f"Invalid status '{status}'. Allowed: {', '.join(sorted(allowed))}.")
+    if status not in APPROVAL_STATUSES:
+        return _err(
+            f"Invalid status '{status}'. Allowed: {', '.join(sorted(APPROVAL_STATUSES))}."
+        )
     return await _get(f"/companies/{COMPANY}/approvals", {"status": status})
 
 
@@ -432,10 +543,14 @@ async def approve(approval_id: str, comment: str = "") -> Any:
         approval_id: Approval UUID.
         comment: Optional approval note to attach (e.g. conditions, context).
     """
+    try:
+        ref = _uuid_param(approval_id, "approval_id")
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if comment:
         body["comment"] = comment
-    return await _post(f"/approvals/{approval_id}/approve", body)
+    return await _post(f"/approvals/{ref}/approve", body)
 
 
 @mcp.tool()
@@ -446,10 +561,14 @@ async def reject(approval_id: str, comment: str = "") -> Any:
         approval_id: Approval UUID.
         comment: Reason for rejection — strongly recommended so the agent understands why.
     """
+    try:
+        ref = _uuid_param(approval_id, "approval_id")
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if comment:
         body["comment"] = comment
-    return await _post(f"/approvals/{approval_id}/reject", body)
+    return await _post(f"/approvals/{ref}/reject", body)
 
 
 @mcp.tool()
@@ -462,9 +581,13 @@ async def request_approval_revision(approval_id: str, comment: str) -> Any:
         approval_id: Approval UUID.
         comment: Required. Specific feedback describing what must change before approval.
     """
+    try:
+        ref = _uuid_param(approval_id, "approval_id")
+    except ValueError as exc:
+        return _err(str(exc))
     if not comment.strip():
         return _err("A comment is required when requesting a revision.")
-    return await _post(f"/approvals/{approval_id}/request-revision", {"comment": comment})
+    return await _post(f"/approvals/{ref}/request-revision", {"comment": comment})
 
 
 # ── COSTS & MONITORING ─────────────────────────────────────────────────────────
