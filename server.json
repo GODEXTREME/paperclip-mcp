@@ -28,6 +28,11 @@
       "required": false,
       "secret": false,
       "default": "http://localhost:3100/api"
+    },
+    "MCP_AUTH_TOKEN": {
+      "description": "Bearer token required by HTTP transports (streamable-http/sse). The server refuses to start over HTTP without it; not used by stdio. Generate with: openssl rand -hex 32.",
+      "required": true,
+      "secret": true
     }
   },
   "capabilities": {

@@ -14,6 +14,9 @@ Configuration (environment variables):
     PAPERCLIP_COMPANY_ID   Required. Company UUID shown in the Paperclip UI URL
                            when viewing your company: /companies/{uuid}.
     PAPERCLIP_BASE_URL     Optional. Default: http://localhost:3100/api
+    MCP_AUTH_TOKEN         Required for HTTP transports. Bearer token MCP
+                           clients must present; generate with
+                           `openssl rand -hex 32`. Not used by stdio.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import sys
 import urllib.parse
 import uuid
@@ -31,6 +35,9 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -269,6 +276,26 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
         log.info("paperclip-mcp stopped.")
 
 
+# ── HTTP transport authentication ──────────────────────────────────────────────
+
+class StaticBearerVerifier(TokenVerifier):
+    """FastMCP TokenVerifier backed by a single static secret (MCP_AUTH_TOKEN).
+
+    Every HTTP request must carry `Authorization: Bearer <token>`; anything
+    else gets a 401 from FastMCP's auth middleware before reaching MCP routes.
+    Comparison uses secrets.compare_digest to resist timing attacks.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token.encode("utf-8")
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if secrets.compare_digest(token.encode("utf-8"), self._token):
+            return AccessToken(token=token, client_id="paperclip-mcp", scopes=[])
+        return None
+
+
 # ── MCP Server ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -282,6 +309,16 @@ mcp = FastMCP(
     ),
     lifespan=_lifespan,
 )
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def _healthz(_request: Request) -> JSONResponse:
+    """Unauthenticated liveness probe for container health checks.
+
+    Custom routes sit outside FastMCP's auth middleware. Returns nothing but
+    a constant payload — no configuration, versions, or state.
+    """
+    return JSONResponse({"ok": True})
 
 
 # ── ISSUES ─────────────────────────────────────────────────────────────────────
@@ -720,9 +757,24 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.transport == "stdio":
+        # stdio is only reachable by the local parent process — no token needed.
         mcp.run(transport="stdio")
-    else:
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
+        return
+
+    token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+    if not token:
+        log.error(
+            "MCP_AUTH_TOKEN is not set — refusing to start an unauthenticated "
+            "HTTP transport (it would expose your Paperclip API key to anyone "
+            "who can reach port %d).\n"
+            "  Generate a token:  openssl rand -hex 32\n"
+            "  Then set it:       export MCP_AUTH_TOKEN=<token>  (or add to .env)\n"
+            "  No-network option: paperclip-mcp --transport stdio",
+            args.port,
+        )
+        sys.exit(1)
+    mcp.auth = StaticBearerVerifier(token)
+    mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
