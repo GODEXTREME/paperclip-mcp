@@ -18,6 +18,7 @@ Configuration (environment variables):
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -57,14 +58,27 @@ log = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 30  # seconds
 
+# Single pooled client, created in the server lifespan and closed on shutdown.
+_http_client: httpx.AsyncClient | None = None
 
-def _headers() -> dict[str, str]:
-    """Build per-request headers.  Omit X-Paperclip-Run-Id — a fake UUID causes
-    FK violations against heartbeat_runs when the API logs activity."""
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
+
+def _build_http_client() -> httpx.AsyncClient:
+    """Build the shared Paperclip API client.
+
+    follow_redirects is off so a redirect from the Paperclip server can never
+    re-send the bearer token to another host. The Authorization header lives on
+    the client and is never logged. Omit X-Paperclip-Run-Id — a fake UUID causes
+    FK violations against heartbeat_runs when the API logs activity.
+    """
+    return httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT,
+        limits=httpx.Limits(max_connections=10),
+        follow_redirects=False,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
 
 
 def _err(message: str, status: int | None = None) -> dict[str, Any]:
@@ -133,37 +147,40 @@ async def _request(
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
 ) -> Any:
+    if _http_client is None:
+        return _err("Server is not fully started yet (HTTP client unavailable). Retry shortly.")
     url = f"{BASE_URL}{path}"
     try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            r = await client.request(
-                method,
-                url,
-                headers=_headers(),
-                params=params,
-                json=body,
+        r = await _http_client.request(method, url, params=params, json=body)
+        # 409 Conflict on checkout: another agent owns the issue — do not retry.
+        if r.status_code == 409:
+            return _err(
+                "Conflict (409): resource is already checked out or owned by another agent. "
+                "Do not retry this request.",
+                status=409,
             )
-            # 409 Conflict on checkout: another agent owns the issue — do not retry.
-            if r.status_code == 409:
-                return _err(
-                    "Conflict (409): resource is already checked out or owned by another agent. "
-                    "Do not retry this request.",
-                    status=409,
-                )
-            r.raise_for_status()
-            # 204 No Content
-            if r.status_code == 204 or not r.content:
-                return {"ok": True}
-            return r.json()
+        # Redirects are not followed (see _build_http_client) and are unexpected.
+        if r.is_redirect:
+            return _err(
+                f"Unexpected redirect ({r.status_code}) from Paperclip API — not followed.",
+                status=r.status_code,
+            )
+        r.raise_for_status()
+        # 204 No Content
+        if r.status_code == 204 or not r.content:
+            return {"ok": True}
+        return r.json()
     except httpx.HTTPStatusError as exc:
+        # Only status code and a truncated body — never request details/headers.
         return _err(
             f"HTTP {exc.response.status_code} from Paperclip API: {exc.response.text[:400]}",
             status=exc.response.status_code,
         )
     except httpx.RequestError as exc:
+        # Report only the error class: exception text could embed request details.
         return _err(
-            f"Could not reach Paperclip at {BASE_URL}. "
-            f"Is the server running? Error: {exc}"
+            f"Could not reach Paperclip at {BASE_URL} ({type(exc).__name__}). "
+            "Is the server running?"
         )
 
 
@@ -180,6 +197,22 @@ async def _patch(path: str, body: dict[str, Any]) -> Any:
 
 
 # ── Startup validation ─────────────────────────────────────────────────────────
+
+def _mask_key(key: str) -> str:
+    """Render an API key safe for logs: only the last 4 characters survive."""
+    return f"…{key[-4:]}" if len(key) >= 8 else "(set, too short to mask)"
+
+
+def _is_private_host(host: str) -> bool:
+    """True for localhost, .local names, and private/loopback IP literals."""
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback
+
 
 def _validate_config() -> None:
     """Fail fast with actionable error messages if required env vars are missing."""
@@ -203,14 +236,37 @@ def _validate_config() -> None:
             "/companies/{uuid}."
         )
         sys.exit(1)
+    if not BASE_URL.startswith(("http://", "https://")):
+        log.error(
+            "PAPERCLIP_BASE_URL must start with http:// or https:// (got: %s)", BASE_URL
+        )
+        sys.exit(1)
+    host = urllib.parse.urlsplit(BASE_URL).hostname or ""
+    if BASE_URL.startswith("http://") and not _is_private_host(host):
+        log.warning(
+            "PAPERCLIP_BASE_URL uses plain HTTP to a non-private host (%s) — "
+            "the API key travels unencrypted. Switch to https://.",
+            host,
+        )
 
 
 @asynccontextmanager
 async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    global _http_client
     _validate_config()
-    log.info("paperclip-mcp started — base: %s | company: %s", BASE_URL, COMPANY)
-    yield
-    log.info("paperclip-mcp stopped.")
+    _http_client = _build_http_client()
+    log.info(
+        "paperclip-mcp started — base: %s | company: %s | api key: %s (masked)",
+        BASE_URL,
+        COMPANY,
+        _mask_key(API_KEY),
+    )
+    try:
+        yield
+    finally:
+        await _http_client.aclose()
+        _http_client = None
+        log.info("paperclip-mcp stopped.")
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
