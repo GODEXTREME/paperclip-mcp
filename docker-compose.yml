@@ -20,15 +20,13 @@ services:
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
 
     ports:
-      # Option 1 (recommended): only reachable from the NAS itself — put a
-      # reverse proxy with TLS (or Tailscale) in front of it on the NAS.
-      - "127.0.0.1:9011:9011"
+      # Option 1: exposed on the LAN — acceptable because every request must
+      # carry the MCP_AUTH_TOKEN bearer token. TLS via reverse proxy recommended.
+      - "9011:9011"
       #
-      # Option 2: exposed on the LAN. Acceptable only because every request
-      # must carry the MCP_AUTH_TOKEN bearer token — but the token still
-      # travels in cleartext over plain HTTP, so a TLS reverse proxy is
-      # strongly recommended even on a trusted LAN.
-      # - "9011:9011"
+      # Option 2 (more locked down): only reachable from the NAS itself.
+      # Put a reverse proxy with TLS (or Tailscale) in front on the NAS.
+      # - "127.0.0.1:9011:9011"
 
     # Container hardening
     read_only: true
