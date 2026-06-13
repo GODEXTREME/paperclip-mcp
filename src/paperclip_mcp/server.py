@@ -14,19 +14,30 @@ Configuration (environment variables):
     PAPERCLIP_COMPANY_ID   Required. Company UUID shown in the Paperclip UI URL
                            when viewing your company: /companies/{uuid}.
     PAPERCLIP_BASE_URL     Optional. Default: http://localhost:3100/api
+    MCP_AUTH_TOKEN         Required for HTTP transports. Bearer token MCP
+                           clients must present; generate with
+                           `openssl rand -hex 32`. Not used by stdio.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
+import secrets
 import sys
+import urllib.parse
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -54,14 +65,27 @@ log = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 30  # seconds
 
+# Single pooled client, created in the server lifespan and closed on shutdown.
+_http_client: httpx.AsyncClient | None = None
 
-def _headers() -> dict[str, str]:
-    """Build per-request headers.  Omit X-Paperclip-Run-Id — a fake UUID causes
-    FK violations against heartbeat_runs when the API logs activity."""
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
+
+def _build_http_client() -> httpx.AsyncClient:
+    """Build the shared Paperclip API client.
+
+    follow_redirects is off so a redirect from the Paperclip server can never
+    re-send the bearer token to another host. The Authorization header lives on
+    the client and is never logged. Omit X-Paperclip-Run-Id — a fake UUID causes
+    FK violations against heartbeat_runs when the API logs activity.
+    """
+    return httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT,
+        limits=httpx.Limits(max_connections=10),
+        follow_redirects=False,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
 
 
 def _err(message: str, status: int | None = None) -> dict[str, Any]:
@@ -72,6 +96,57 @@ def _err(message: str, status: int | None = None) -> dict[str, Any]:
     return payload
 
 
+# ── Parameter sanitization ─────────────────────────────────────────────────────
+#
+# Tool parameters are interpolated into URL paths. Every value MUST pass through
+# one of the helpers below before reaching an f-string, otherwise a crafted id
+# (e.g. "../companies/x" or "abc?admin=1") can rewrite the request path/query.
+
+_MAX_PARAM_LEN = 128
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_ISSUE_REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+ISSUE_STATUSES = {"todo", "in_progress", "blocked", "done", "cancelled"}
+ISSUE_PRIORITIES = {"urgent", "high", "medium", "low"}
+APPROVAL_STATUSES = {"pending", "approved", "rejected", "revision_requested"}
+
+
+def _path_param(value: str, name: str = "parameter") -> str:
+    """Validate and percent-encode a value destined for a URL path segment.
+
+    Raises ValueError if the value is empty, too long, or contains control
+    characters. The returned string is fully quoted (no characters are exempt),
+    so path separators, "?", "#", etc. cannot alter the request target.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty.")
+    if len(value) > _MAX_PARAM_LEN:
+        raise ValueError(f"{name} is too long (max {_MAX_PARAM_LEN} characters).")
+    if _CONTROL_CHARS_RE.search(value):
+        raise ValueError(f"{name} contains control characters.")
+    return urllib.parse.quote(value, safe="")
+
+
+def _uuid_param(value: str, name: str) -> str:
+    """Validate a parameter that is a UUID by contract; returns the canonical form."""
+    try:
+        return str(uuid.UUID(value.strip()))
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be a valid UUID.") from None
+
+
+def _issue_ref(value: str, name: str = "issue_id") -> str:
+    """Validate an issue reference: UUID or human-readable id like "CY-42"."""
+    value = value.strip()
+    if not _ISSUE_REF_RE.fullmatch(value):
+        raise ValueError(
+            f"{name} must be a UUID or an identifier like 'CY-42' "
+            "(letters, digits, '-' and '_', 1-64 chars)."
+        )
+    return _path_param(value, name)
+
+
 async def _request(
     method: str,
     path: str,
@@ -79,37 +154,40 @@ async def _request(
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
 ) -> Any:
+    if _http_client is None:
+        return _err("Server is not fully started yet (HTTP client unavailable). Retry shortly.")
     url = f"{BASE_URL}{path}"
     try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            r = await client.request(
-                method,
-                url,
-                headers=_headers(),
-                params=params,
-                json=body,
+        r = await _http_client.request(method, url, params=params, json=body)
+        # 409 Conflict on checkout: another agent owns the issue — do not retry.
+        if r.status_code == 409:
+            return _err(
+                "Conflict (409): resource is already checked out or owned by another agent. "
+                "Do not retry this request.",
+                status=409,
             )
-            # 409 Conflict on checkout: another agent owns the issue — do not retry.
-            if r.status_code == 409:
-                return _err(
-                    "Conflict (409): resource is already checked out or owned by another agent. "
-                    "Do not retry this request.",
-                    status=409,
-                )
-            r.raise_for_status()
-            # 204 No Content
-            if r.status_code == 204 or not r.content:
-                return {"ok": True}
-            return r.json()
+        # Redirects are not followed (see _build_http_client) and are unexpected.
+        if r.is_redirect:
+            return _err(
+                f"Unexpected redirect ({r.status_code}) from Paperclip API — not followed.",
+                status=r.status_code,
+            )
+        r.raise_for_status()
+        # 204 No Content
+        if r.status_code == 204 or not r.content:
+            return {"ok": True}
+        return r.json()
     except httpx.HTTPStatusError as exc:
+        # Only status code and a truncated body — never request details/headers.
         return _err(
             f"HTTP {exc.response.status_code} from Paperclip API: {exc.response.text[:400]}",
             status=exc.response.status_code,
         )
     except httpx.RequestError as exc:
+        # Report only the error class: exception text could embed request details.
         return _err(
-            f"Could not reach Paperclip at {BASE_URL}. "
-            f"Is the server running? Error: {exc}"
+            f"Could not reach Paperclip at {BASE_URL} ({type(exc).__name__}). "
+            "Is the server running?"
         )
 
 
@@ -125,11 +203,23 @@ async def _patch(path: str, body: dict[str, Any]) -> Any:
     return await _request("PATCH", path, body=body)
 
 
-async def _delete(path: str) -> Any:
-    return await _request("DELETE", path)
-
-
 # ── Startup validation ─────────────────────────────────────────────────────────
+
+def _mask_key(key: str) -> str:
+    """Render an API key safe for logs: only the last 4 characters survive."""
+    return f"…{key[-4:]}" if len(key) >= 8 else "(set, too short to mask)"
+
+
+def _is_private_host(host: str) -> bool:
+    """True for localhost, .local names, and private/loopback IP literals."""
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback
+
 
 def _validate_config() -> None:
     """Fail fast with actionable error messages if required env vars are missing."""
@@ -145,14 +235,65 @@ def _validate_config() -> None:
             "Or set them in your shell before starting the server."
         )
         sys.exit(1)
+    try:
+        _uuid_param(COMPANY, "PAPERCLIP_COMPANY_ID")
+    except ValueError:
+        log.error(
+            "PAPERCLIP_COMPANY_ID must be a UUID — find it in the Paperclip UI URL: "
+            "/companies/{uuid}."
+        )
+        sys.exit(1)
+    if not BASE_URL.startswith(("http://", "https://")):
+        log.error(
+            "PAPERCLIP_BASE_URL must start with http:// or https:// (got: %s)", BASE_URL
+        )
+        sys.exit(1)
+    host = urllib.parse.urlsplit(BASE_URL).hostname or ""
+    if BASE_URL.startswith("http://") and not _is_private_host(host):
+        log.warning(
+            "PAPERCLIP_BASE_URL uses plain HTTP to a non-private host (%s) — "
+            "the API key travels unencrypted. Switch to https://.",
+            host,
+        )
 
 
 @asynccontextmanager
-async def _lifespan(_server: FastMCP):  # type: ignore[type-arg]
+async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
+    global _http_client
     _validate_config()
-    log.info("paperclip-mcp started — base: %s | company: %s", BASE_URL, COMPANY)
-    yield
-    log.info("paperclip-mcp stopped.")
+    _http_client = _build_http_client()
+    log.info(
+        "paperclip-mcp started — base: %s | company: %s | api key: %s (masked)",
+        BASE_URL,
+        COMPANY,
+        _mask_key(API_KEY),
+    )
+    try:
+        yield
+    finally:
+        await _http_client.aclose()
+        _http_client = None
+        log.info("paperclip-mcp stopped.")
+
+
+# ── HTTP transport authentication ──────────────────────────────────────────────
+
+class StaticBearerVerifier(TokenVerifier):
+    """FastMCP TokenVerifier backed by a single static secret (MCP_AUTH_TOKEN).
+
+    Every HTTP request must carry `Authorization: Bearer <token>`; anything
+    else gets a 401 from FastMCP's auth middleware before reaching MCP routes.
+    Comparison uses secrets.compare_digest to resist timing attacks.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token.encode("utf-8")
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if secrets.compare_digest(token.encode("utf-8"), self._token):
+            return AccessToken(token=token, client_id="paperclip-mcp", scopes=[])
+        return None
 
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
@@ -168,6 +309,16 @@ mcp = FastMCP(
     ),
     lifespan=_lifespan,
 )
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def _healthz(_request: Request) -> JSONResponse:
+    """Unauthenticated liveness probe for container health checks.
+
+    Custom routes sit outside FastMCP's auth middleware. Returns nothing but
+    a constant payload — no configuration, versions, or state.
+    """
+    return JSONResponse({"ok": True})
 
 
 # ── ISSUES ─────────────────────────────────────────────────────────────────────
@@ -191,7 +342,14 @@ async def list_issues(
         label: Label name to filter by. Leave empty to skip label filtering.
         limit: Maximum number of results to return (1–200). Default: 50.
     """
-    params: dict[str, Any] = {"status": status, "limit": max(1, min(limit, 200))}
+    statuses = [s.strip() for s in status.split(",") if s.strip()]
+    invalid = sorted(set(statuses) - ISSUE_STATUSES)
+    if not statuses or invalid:
+        return _err(
+            f"Invalid status filter '{status}'. "
+            f"Allowed (comma-separated): {', '.join(sorted(ISSUE_STATUSES))}."
+        )
+    params: dict[str, Any] = {"status": ",".join(statuses), "limit": max(1, min(limit, 200))}
     if assignee_agent_id:
         params["assigneeAgentId"] = assignee_agent_id
     if project_id:
@@ -208,7 +366,11 @@ async def get_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or human-readable identifier (e.g. "CY-42").
     """
-    return await _get(f"/issues/{issue_id}")
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _get(f"/issues/{ref}")
 
 
 @mcp.tool()
@@ -229,7 +391,8 @@ async def create_issue(
         description: Full instructions or context for the agent (Markdown supported).
         assignee_agent_id: UUID of the agent to assign. Leave empty to leave unassigned.
         project_id: UUID of the project this issue belongs to. Leave empty for no project.
-        parent_issue_id: UUID of the parent issue when creating a subtask. Leave empty for top-level.
+        parent_issue_id: UUID of the parent issue when creating a subtask.
+                         Leave empty for top-level.
         priority: Task priority — urgent, high, medium, or low. Default: medium.
     """
     body: dict[str, Any] = {"title": title, "priority": priority}
@@ -264,24 +427,35 @@ async def update_issue(
         assignee_agent_id: New agent UUID. Leave empty to keep current assignee.
         priority: New priority — urgent, high, medium, or low. Leave empty to keep current.
     """
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if title:
         body["title"] = title
     if description:
         body["description"] = description
     if status:
-        if status not in {"todo", "in_progress", "blocked", "done", "cancelled"}:
-            return _err(f"Invalid status '{status}'. Allowed: todo, in_progress, blocked, done, cancelled.")
+        if status not in ISSUE_STATUSES:
+            return _err(
+                f"Invalid status '{status}'. Allowed: {', '.join(sorted(ISSUE_STATUSES))}."
+            )
         body["status"] = status
     if assignee_agent_id:
         body["assigneeAgentId"] = assignee_agent_id
     if priority:
-        if priority not in {"urgent", "high", "medium", "low"}:
-            return _err(f"Invalid priority '{priority}'. Allowed: urgent, high, medium, low.")
+        if priority not in ISSUE_PRIORITIES:
+            return _err(
+                f"Invalid priority '{priority}'. Allowed: {', '.join(sorted(ISSUE_PRIORITIES))}."
+            )
         body["priority"] = priority
     if not body:
-        return _err("No fields to update. Provide at least one of: title, description, status, assignee_agent_id, priority.")
-    return await _patch(f"/issues/{issue_id}", body)
+        return _err(
+            "No fields to update. Provide at least one of: "
+            "title, description, status, assignee_agent_id, priority."
+        )
+    return await _patch(f"/issues/{ref}", body)
 
 
 @mcp.tool()
@@ -294,7 +468,11 @@ async def checkout_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to check out.
     """
-    return await _post(f"/issues/{issue_id}/checkout")
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _post(f"/issues/{ref}/checkout")
 
 
 @mcp.tool()
@@ -307,7 +485,11 @@ async def release_issue(issue_id: str) -> Any:
     Args:
         issue_id: Issue UUID or identifier to release.
     """
-    return await _post(f"/issues/{issue_id}/release")
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _post(f"/issues/{ref}/release")
 
 
 @mcp.tool()
@@ -324,20 +506,14 @@ async def comment_on_issue(
         reopen: Set to true to reopen the issue when posting this comment.
                 Only effective if the issue is currently closed.
     """
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
     payload: dict[str, Any] = {"body": body}
     if reopen:
         payload["reopen"] = True
-    return await _post(f"/issues/{issue_id}/comments", payload)
-
-
-@mcp.tool()
-async def delete_issue(issue_id: str) -> Any:
-    """Permanently delete an issue. This action cannot be undone.
-
-    Args:
-        issue_id: Issue UUID or identifier to delete.
-    """
-    return await _delete(f"/issues/{issue_id}")
+    return await _post(f"/issues/{ref}/comments", payload)
 
 
 # ── AGENTS ─────────────────────────────────────────────────────────────────────
@@ -356,8 +532,13 @@ async def get_agent(agent_id: str = "me") -> Any:
         agent_id: Agent UUID, or the literal string "me" to get the current agent identity.
                   Default: "me"
     """
-    path = "/agents/me" if agent_id.strip().lower() == "me" else f"/agents/{agent_id}"
-    return await _get(path)
+    if agent_id.strip().lower() == "me":
+        return await _get("/agents/me")
+    try:
+        ref = _uuid_param(agent_id, "agent_id")
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _get(f"/agents/{ref}")
 
 
 @mcp.tool()
@@ -370,7 +551,11 @@ async def invoke_agent_heartbeat(agent_id: str) -> Any:
     Args:
         agent_id: UUID of the agent to trigger.
     """
-    return await _post(f"/agents/{agent_id}/heartbeat/invoke")
+    try:
+        ref = _uuid_param(agent_id, "agent_id")
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _post(f"/agents/{ref}/heartbeat/invoke")
 
 
 # ── GOALS ──────────────────────────────────────────────────────────────────────
@@ -411,6 +596,10 @@ async def update_goal(
         title: New title. Leave empty to keep current.
         description: New description. Leave empty to keep current.
     """
+    try:
+        ref = _uuid_param(goal_id, "goal_id")
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if title:
         body["title"] = title
@@ -418,7 +607,7 @@ async def update_goal(
         body["description"] = description
     if not body:
         return _err("No fields to update. Provide at least one of: title, description.")
-    return await _patch(f"/goals/{goal_id}", body)
+    return await _patch(f"/goals/{ref}", body)
 
 
 # ── APPROVALS ──────────────────────────────────────────────────────────────────
@@ -432,9 +621,10 @@ async def list_approvals(status: str = "pending") -> Any:
                 pending, approved, rejected, revision_requested.
                 Default: "pending"
     """
-    allowed = {"pending", "approved", "rejected", "revision_requested"}
-    if status not in allowed:
-        return _err(f"Invalid status '{status}'. Allowed: {', '.join(sorted(allowed))}.")
+    if status not in APPROVAL_STATUSES:
+        return _err(
+            f"Invalid status '{status}'. Allowed: {', '.join(sorted(APPROVAL_STATUSES))}."
+        )
     return await _get(f"/companies/{COMPANY}/approvals", {"status": status})
 
 
@@ -446,10 +636,14 @@ async def approve(approval_id: str, comment: str = "") -> Any:
         approval_id: Approval UUID.
         comment: Optional approval note to attach (e.g. conditions, context).
     """
+    try:
+        ref = _uuid_param(approval_id, "approval_id")
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if comment:
         body["comment"] = comment
-    return await _post(f"/approvals/{approval_id}/approve", body)
+    return await _post(f"/approvals/{ref}/approve", body)
 
 
 @mcp.tool()
@@ -460,10 +654,14 @@ async def reject(approval_id: str, comment: str = "") -> Any:
         approval_id: Approval UUID.
         comment: Reason for rejection — strongly recommended so the agent understands why.
     """
+    try:
+        ref = _uuid_param(approval_id, "approval_id")
+    except ValueError as exc:
+        return _err(str(exc))
     body: dict[str, Any] = {}
     if comment:
         body["comment"] = comment
-    return await _post(f"/approvals/{approval_id}/reject", body)
+    return await _post(f"/approvals/{ref}/reject", body)
 
 
 @mcp.tool()
@@ -476,9 +674,13 @@ async def request_approval_revision(approval_id: str, comment: str) -> Any:
         approval_id: Approval UUID.
         comment: Required. Specific feedback describing what must change before approval.
     """
+    try:
+        ref = _uuid_param(approval_id, "approval_id")
+    except ValueError as exc:
+        return _err(str(exc))
     if not comment.strip():
         return _err("A comment is required when requesting a revision.")
-    return await _post(f"/approvals/{approval_id}/request-revision", {"comment": comment})
+    return await _post(f"/approvals/{ref}/request-revision", {"comment": comment})
 
 
 # ── COSTS & MONITORING ─────────────────────────────────────────────────────────
@@ -555,9 +757,24 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.transport == "stdio":
+        # stdio is only reachable by the local parent process — no token needed.
         mcp.run(transport="stdio")
-    else:
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
+        return
+
+    token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+    if not token:
+        log.error(
+            "MCP_AUTH_TOKEN is not set — refusing to start an unauthenticated "
+            "HTTP transport (it would expose your Paperclip API key to anyone "
+            "who can reach port %d).\n"
+            "  Generate a token:  openssl rand -hex 32\n"
+            "  Then set it:       export MCP_AUTH_TOKEN=<token>  (or add to .env)\n"
+            "  No-network option: paperclip-mcp --transport stdio",
+            args.port,
+        )
+        sys.exit(1)
+    mcp.auth = StaticBearerVerifier(token)
+    mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

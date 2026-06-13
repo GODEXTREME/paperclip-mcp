@@ -33,6 +33,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.5",
     "mypy>=1.10",
+    "pip-audit>=2.7",
 ]
 
 [project.urls]
@@ -52,12 +53,17 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "ANN"]
-ignore = ["ANN101", "ANN102"]
+# ANN401: MCP tools return arbitrary JSON from the Paperclip API — Any is the
+# honest type for those returns.
+ignore = ["ANN401"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
 ignore_missing_imports = true
+# fastmcp's @mcp.tool() decorator is not typed strictly enough for
+# --strict; everything else stays strict.
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
