@@ -318,6 +318,8 @@ class PaperclipAuthProvider(InMemoryOAuthProvider):
             ],
             grant_types=["authorization_code"],
             response_types=["code"],
+            # Claude.ai sends client_secret as a POST form field (not Basic auth header)
+            token_endpoint_auth_method="client_secret_post",
         )
         # Pre-load the static bearer token — expires_at=None means it never expires.
         self.access_tokens[token] = AccessToken(
