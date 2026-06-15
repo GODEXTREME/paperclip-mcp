@@ -2,7 +2,7 @@
   "$schema": "https://modelcontextprotocol.io/schemas/registry/server.json",
   "name": "paperclip-mcp",
   "description": "MCP server for the Paperclip AI agent orchestration platform. Manage issues, agents, goals, approvals, and costs via natural language.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "installation": {
     "type": "pypi",
@@ -45,7 +45,9 @@
       "list_issues", "get_issue", "create_issue", "update_issue",
       "checkout_issue", "release_issue", "comment_on_issue",
       "list_agents", "get_agent", "invoke_agent_heartbeat",
-      "list_goals", "create_goal", "update_goal",
+      "list_goals", "get_goal", "create_goal", "update_goal",
+      "list_projects", "get_project",
+      "list_comments",
       "list_approvals", "approve", "reject", "request_approval_revision",
       "get_cost_summary", "get_dashboard", "list_activity"
     ]

@@ -10,9 +10,10 @@ Exposes Paperclip's REST API as [Model Context Protocol](https://modelcontextpro
 
 | Category | Tools |
 |---|---|
-| **Issues** | `list_issues` · `get_issue` · `create_issue` · `update_issue` · `checkout_issue` · `release_issue` · `comment_on_issue` |
+| **Issues** | `list_issues` · `get_issue` · `create_issue` · `update_issue` · `checkout_issue` · `release_issue` · `comment_on_issue` · `list_comments` |
 | **Agents** | `list_agents` · `get_agent` · `invoke_agent_heartbeat` |
-| **Goals** | `list_goals` · `create_goal` · `update_goal` |
+| **Goals** | `list_goals` · `get_goal` · `create_goal` · `update_goal` |
+| **Projects** | `list_projects` · `get_project` |
 | **Approvals** | `list_approvals` · `approve` · `reject` · `request_approval_revision` |
 | **Monitoring** | `get_cost_summary` · `get_dashboard` · `list_activity` |
 
@@ -32,7 +33,7 @@ Exposes Paperclip's REST API as [Model Context Protocol](https://modelcontextpro
 
 ```bash
 # Clone the repo
-git clone https://github.com/wizarck/paperclip-mcp
+git clone https://github.com/godextreme/paperclip-mcp
 cd paperclip-mcp
 
 # Install (editable for local use, or drop -e for production)
@@ -73,6 +74,17 @@ MCP_AUTH_TOKEN=your_generated_token_here       # required for HTTP transports
 - `MCP_AUTH_TOKEN` — generate yourself: `openssl rand -hex 32`. Every HTTP request to the
   MCP server must present it as `Authorization: Bearer <token>`. The server **refuses to
   start** over HTTP without it (stdio does not need it).
+
+### API key scope and 403 errors
+
+`PAPERCLIP_API_KEY` is bound to a specific Paperclip **agent** persona. That agent's
+authorization boundary controls which issues it can read and modify. If you see 403
+errors when commenting on or updating issues owned by other agents or projects, the
+key belongs to an agent with a narrow scope.
+
+**Fix**: generate the API key using a company-admin or CEO agent persona —
+one that has company-wide write access. Go to Paperclip UI → Settings → API Keys,
+select the admin agent as the key owner, and regenerate.
 
 ---
 
@@ -131,8 +143,14 @@ Once registered, you can ask your AI assistant:
 "What tasks does the Purchasing agent have open?"
 → calls list_issues(assignee_agent_id="...", status="todo,in_progress")
 
+"List all issues for goal X, page 2 (next 50 after the first 50)"
+→ calls list_issues(goal_id="...", limit=50, offset=50)
+
 "Create a task for the CEO agent to search for new cheese suppliers in Barcelona"
 → calls create_issue(title="Search cheese suppliers in Barcelona", assignee_agent_id="...")
+
+"Move issue CY-10 to goal X and remove it from its current project"
+→ calls update_issue(issue_id="CY-10", goal_id="<uuid>", project_id="null")
 
 "Approve the pending hire request"
 → calls list_approvals(status="pending") + approve(approval_id="...")
@@ -142,6 +160,32 @@ Once registered, you can ask your AI assistant:
 
 "Wake up the Administration agent now"
 → calls invoke_agent_heartbeat(agent_id="...")
+
+"Show me the comments on issue CY-42"
+→ calls list_comments(issue_id="CY-42")
+```
+
+### Pagination
+
+`list_issues`, `list_goals`, and `list_activity` all support `limit` and `offset` for
+pagination, and a `summary` flag (default `True`) that projects each item to its key
+fields only — reducing a 200-issue response from ~580 KB to ~30 KB.
+
+```
+list_issues(limit=50, offset=0)   # first page
+list_issues(limit=50, offset=50)  # second page
+list_issues(summary=False)        # full objects (use sparingly)
+```
+
+### Unlinking relationships
+
+Pass the literal string `"null"` to remove a link without providing a new one:
+
+```
+update_issue(issue_id="CY-1", parent_issue_id="null")  # detach subtask
+update_issue(issue_id="CY-1", goal_id="null")           # unlink from goal
+update_issue(issue_id="CY-1", project_id="null")        # remove from project
+update_goal(goal_id="...", parent_id="null")             # promote to top-level
 ```
 
 ---
