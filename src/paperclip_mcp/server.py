@@ -43,6 +43,7 @@ from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import OAuthClientInformationFull
+from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -312,7 +313,9 @@ class PaperclipAuthProvider(InMemoryOAuthProvider):
         self.clients[OAUTH_CLIENT_ID] = OAuthClientInformationFull(
             client_id=OAUTH_CLIENT_ID,
             client_secret=token,
-            redirect_uris=[],   # AuthorizationHandler validates; empty = accept any
+            redirect_uris=[
+                AnyUrl("https://claude.ai/api/mcp/auth_callback"),
+            ],
             grant_types=["authorization_code"],
             response_types=["code"],
         )
