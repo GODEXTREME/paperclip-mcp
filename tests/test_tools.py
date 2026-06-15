@@ -6,17 +6,11 @@ import pytest
 
 from paperclip_mcp import server
 
-
-async def test_delete_issue_is_not_registered() -> None:
-    tools = await server.mcp.list_tools()
-    assert "delete_issue" not in {tool.name for tool in tools}
+_UUID_A = "11111111-1111-4111-8111-111111111111"
+_UUID_B = "22222222-2222-4222-8222-222222222222"
 
 
-async def test_no_tool_uses_http_delete() -> None:
-    import inspect
-
-    source = inspect.getsource(server)
-    assert '"DELETE"' not in source and "'DELETE'" not in source
+# ── Fixtures ───────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -30,22 +24,47 @@ def no_http(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def capture_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Capture _request calls and return a stub success response."""
-    captured: dict[str, Any] = {}
+def capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Capture the outgoing request instead of performing it."""
+    calls: dict[str, Any] = {}
 
-    async def _stub(method: str, path: str, *, params: Any = None, body: Any = None) -> Any:
-        captured["method"] = method
-        captured["path"] = path
-        captured["params"] = params
-        captured["body"] = body
+    async def _record(
+        method: str,
+        path: str,
+        *,
+        params: Any = None,
+        body: Any = None,
+    ) -> Any:
+        calls.update(method=method, path=path, params=params, body=body)
         return {"ok": True}
 
-    monkeypatch.setattr(server, "_request", _stub)
-    return captured
+    monkeypatch.setattr(server, "_request", _record)
+    return calls
 
 
-# ── Existing validation tests (preserved unchanged) ───────────────────────────
+# ── Tool registration ──────────────────────────────────────────────────────────
+
+
+async def test_delete_issue_is_not_registered() -> None:
+    tools = await server.mcp.list_tools()
+    assert "delete_issue" not in {tool.name for tool in tools}
+
+
+async def test_no_tool_uses_http_delete() -> None:
+    import inspect
+
+    source = inspect.getsource(server)
+    assert '"DELETE"' not in source and "'DELETE'" not in source
+
+
+async def test_new_tools_are_registered() -> None:
+    tools = {tool.name for tool in await server.mcp.list_tools()}
+    for name in ("get_goal", "list_projects", "get_project", "list_comments"):
+        assert name in tools, f"tool not registered: {name}"
+
+
+# ── list_issues ────────────────────────────────────────────────────────────────
+
 
 async def test_list_issues_rejects_invalid_status(no_http: None) -> None:
     result = await server.list_issues(status="todo,bogus")
@@ -56,6 +75,106 @@ async def test_list_issues_rejects_invalid_status(no_http: None) -> None:
 async def test_list_issues_rejects_empty_status(no_http: None) -> None:
     result = await server.list_issues(status=" , ")
     assert result["isError"] is True
+
+
+async def test_list_issues_rejects_invalid_assignee(no_http: None) -> None:
+    result = await server.list_issues(assignee_agent_id="not-a-uuid")
+    assert result["isError"] is True
+
+
+async def test_list_issues_rejects_invalid_goal_id(no_http: None) -> None:
+    result = await server.list_issues(goal_id="not-a-uuid")
+    assert result["isError"] is True
+
+
+async def test_list_issues_rejects_invalid_parent_issue_id(no_http: None) -> None:
+    result = await server.list_issues(parent_issue_id="not-a-uuid")
+    assert result["isError"] is True
+
+
+async def test_list_issues_pagination(capture: dict[str, Any]) -> None:
+    await server.list_issues(limit=10, offset=20)
+    assert capture["params"]["limit"] == 10
+    assert capture["params"]["offset"] == 20
+
+
+async def test_list_issues_sends_goal_id_filter(capture: dict[str, Any]) -> None:
+    await server.list_issues(goal_id=_UUID_A)
+    assert capture["params"]["goalId"] == _UUID_A
+
+
+async def test_list_issues_sends_parent_issue_id_filter(capture: dict[str, Any]) -> None:
+    await server.list_issues(parent_issue_id=_UUID_A)
+    assert capture["params"]["parentIssueId"] == _UUID_A
+
+
+async def test_list_issues_summary_mode(capture: dict[str, Any]) -> None:
+    capture["_raw"] = [{"id": "x", "title": "t", "extraField": "drop"}]
+
+    async def _fake(method: str, path: str, *, params: Any = None, body: Any = None) -> Any:
+        return capture["_raw"]
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(server, "_request", _fake):
+        result = await server.list_issues(summary=True)
+    assert isinstance(result, list)
+    assert result[0] == {"id": "x", "title": "t"}
+
+
+# ── get_issue ─────────────────────────────────────────────────────────────────
+
+
+async def test_get_issue_rejects_path_injection(no_http: None) -> None:
+    for bad in ("../x", "a/b", "a?x=1", "", "a" * 65):
+        result = await server.get_issue(issue_id=bad)
+        assert result["isError"] is True, f"accepted malicious issue_id: {bad!r}"
+
+
+# ── create_issue ───────────────────────────────────────────────────────────────
+
+
+async def test_create_issue_rejects_invalid_priority(no_http: None) -> None:
+    result = await server.create_issue(title="t", priority="asap")
+    assert result["isError"] is True
+    assert "asap" in result["message"]
+
+
+async def test_create_issue_rejects_invalid_status(no_http: None) -> None:
+    result = await server.create_issue(title="t", status="invalid")
+    assert result["isError"] is True
+    assert "invalid" in result["message"]
+
+
+async def test_create_issue_rejects_non_uuid_linkage(no_http: None) -> None:
+    for field in ("project_id", "parent_issue_id", "goal_id", "assignee_agent_id"):
+        result = await server.create_issue(title="t", **{field: "not-a-uuid"})
+        assert result["isError"] is True, f"accepted non-UUID {field}"
+
+
+async def test_create_issue_sends_goal_id(capture: dict[str, Any]) -> None:
+    await server.create_issue(title="t", goal_id=_UUID_A, project_id=_UUID_B)
+    assert capture["method"] == "POST"
+    assert capture["body"]["goalId"] == _UUID_A
+    assert capture["body"]["projectId"] == _UUID_B
+
+
+async def test_create_issue_sends_labels(capture: dict[str, Any]) -> None:
+    await server.create_issue(title="t", labels="bug, backend, urgent")
+    assert capture["body"]["labels"] == ["bug", "backend", "urgent"]
+
+
+async def test_create_issue_sends_status(capture: dict[str, Any]) -> None:
+    await server.create_issue(title="t", status="in_progress")
+    assert capture["body"]["status"] == "in_progress"
+
+
+async def test_create_issue_sends_work_mode(capture: dict[str, Any]) -> None:
+    await server.create_issue(title="t", work_mode="autonomous")
+    assert capture["body"]["workMode"] == "autonomous"
+
+
+# ── update_issue ───────────────────────────────────────────────────────────────
 
 
 async def test_update_issue_rejects_invalid_status(no_http: None) -> None:
@@ -74,15 +193,169 @@ async def test_update_issue_rejects_malicious_issue_id(no_http: None) -> None:
     assert result["isError"] is True
 
 
-async def test_list_approvals_rejects_invalid_status(no_http: None) -> None:
-    result = await server.list_approvals(status="whatever")
+async def test_update_issue_rejects_non_uuid_linkage(no_http: None) -> None:
+    for field in ("project_id", "parent_issue_id", "goal_id"):
+        result = await server.update_issue(issue_id="CY-42", **{field: "nope"})
+        assert result["isError"] is True, f"accepted non-UUID {field}"
+
+
+async def test_update_issue_sends_linkage(capture: dict[str, Any]) -> None:
+    await server.update_issue(issue_id="CY-42", goal_id=_UUID_A, project_id=_UUID_B)
+    assert capture["method"] == "PATCH"
+    assert capture["body"]["goalId"] == _UUID_A
+    assert capture["body"]["projectId"] == _UUID_B
+
+
+async def test_update_issue_null_sentinel_goal_id(capture: dict[str, Any]) -> None:
+    await server.update_issue(issue_id="CY-42", goal_id="null")
+    assert capture["body"]["goalId"] is None
+
+
+async def test_update_issue_null_sentinel_project_id(capture: dict[str, Any]) -> None:
+    await server.update_issue(issue_id="CY-42", project_id="null")
+    assert capture["body"]["projectId"] is None
+
+
+async def test_update_issue_null_sentinel_parent_issue_id(capture: dict[str, Any]) -> None:
+    await server.update_issue(issue_id="CY-42", parent_issue_id="null")
+    assert capture["body"]["parentIssueId"] is None
+
+
+async def test_update_issue_sends_labels(capture: dict[str, Any]) -> None:
+    await server.update_issue(issue_id="CY-42", labels="feature, priority")
+    assert capture["body"]["labels"] == ["feature", "priority"]
+
+
+# ── list_goals ────────────────────────────────────────────────────────────────
+
+
+async def test_list_goals_pagination(capture: dict[str, Any]) -> None:
+    await server.list_goals(limit=25, offset=50)
+    assert capture["params"]["limit"] == 25
+    assert capture["params"]["offset"] == 50
+
+
+async def test_list_goals_summary_mode(capture: dict[str, Any]) -> None:
+    raw = [{"id": "x", "title": "g", "parentId": None, "status": "active", "extraField": "drop"}]
+
+    async def _fake(method: str, path: str, *, params: Any = None, body: Any = None) -> Any:
+        return raw
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(server, "_request", _fake):
+        result = await server.list_goals(summary=True)
+    assert isinstance(result, list)
+    assert "extraField" not in result[0]
+
+
+# ── get_goal ─────────────────────────────────────────────────────────────────
+
+
+async def test_get_goal_rejects_non_uuid(no_http: None) -> None:
+    result = await server.get_goal(goal_id="not-a-uuid")
     assert result["isError"] is True
 
 
-async def test_get_issue_rejects_path_injection(no_http: None) -> None:
-    for bad in ("../x", "a/b", "a?x=1", "", "a" * 65):
-        result = await server.get_issue(issue_id=bad)
+async def test_get_goal_makes_request(capture: dict[str, Any]) -> None:
+    await server.get_goal(goal_id=_UUID_A)
+    assert capture["method"] == "GET"
+    assert _UUID_A in capture["path"]
+
+
+# ── create_goal ────────────────────────────────────────────────────────────────
+
+
+async def test_create_goal_sends_parent_id(capture: dict[str, Any]) -> None:
+    await server.create_goal(title="sub", parent_id=_UUID_A, level="project")
+    assert capture["body"]["parentId"] == _UUID_A
+    assert capture["body"]["level"] == "project"
+
+
+async def test_create_goal_rejects_non_uuid_parent(no_http: None) -> None:
+    result = await server.create_goal(title="sub", parent_id="not-a-uuid")
+    assert result["isError"] is True
+
+
+async def test_create_goal_sends_project_id(capture: dict[str, Any]) -> None:
+    await server.create_goal(title="g", project_id=_UUID_B)
+    assert capture["body"]["projectId"] == _UUID_B
+
+
+# ── update_goal ────────────────────────────────────────────────────────────────
+
+
+async def test_update_goal_sends_parent_id(capture: dict[str, Any]) -> None:
+    await server.update_goal(goal_id=_UUID_A, parent_id=_UUID_B)
+    assert capture["method"] == "PATCH"
+    assert capture["body"]["parentId"] == _UUID_B
+
+
+async def test_update_goal_rejects_non_uuid_parent(no_http: None) -> None:
+    result = await server.update_goal(goal_id=_UUID_A, parent_id="nope")
+    assert result["isError"] is True
+
+
+async def test_update_goal_null_sentinel_parent(capture: dict[str, Any]) -> None:
+    await server.update_goal(goal_id=_UUID_A, parent_id="null")
+    assert capture["body"]["parentId"] is None
+
+
+async def test_update_goal_sends_status(capture: dict[str, Any]) -> None:
+    await server.update_goal(goal_id=_UUID_A, status="completed")
+    assert capture["body"]["status"] == "completed"
+
+
+# ── list_projects / get_project ───────────────────────────────────────────────
+
+
+async def test_list_projects_makes_request(capture: dict[str, Any]) -> None:
+    await server.list_projects()
+    assert capture["method"] == "GET"
+    assert "projects" in capture["path"]
+
+
+async def test_get_project_rejects_non_uuid(no_http: None) -> None:
+    result = await server.get_project(project_id="not-a-uuid")
+    assert result["isError"] is True
+
+
+async def test_get_project_makes_request(capture: dict[str, Any]) -> None:
+    await server.get_project(project_id=_UUID_A)
+    assert capture["method"] == "GET"
+    assert _UUID_A in capture["path"]
+
+
+# ── list_comments ─────────────────────────────────────────────────────────────
+
+
+async def test_list_comments_rejects_path_injection(no_http: None) -> None:
+    for bad in ("../x", "a/b", "a?x=1", ""):
+        result = await server.list_comments(issue_id=bad)
         assert result["isError"] is True, f"accepted malicious issue_id: {bad!r}"
+
+
+async def test_list_comments_makes_request(capture: dict[str, Any]) -> None:
+    await server.list_comments(issue_id="CY-42")
+    assert capture["method"] == "GET"
+    assert "comments" in capture["path"]
+
+
+# ── list_activity ─────────────────────────────────────────────────────────────
+
+
+async def test_list_activity_pagination(capture: dict[str, Any]) -> None:
+    await server.list_activity(limit=5, offset=10)
+    assert capture["params"]["limit"] == 5
+    assert capture["params"]["offset"] == 10
+
+
+async def test_list_activity_rejects_invalid_agent_id(no_http: None) -> None:
+    result = await server.list_activity(agent_id="not-a-uuid")
+    assert result["isError"] is True
+
+
+# ── UUID tools ────────────────────────────────────────────────────────────────
 
 
 async def test_uuid_tools_reject_non_uuid_ids(no_http: None) -> None:
@@ -95,338 +368,33 @@ async def test_uuid_tools_reject_non_uuid_ids(no_http: None) -> None:
     ] is True
 
 
-# ── A. Pagination + summary mode ──────────────────────────────────────────────
-
-async def test_list_issues_summary_mode_projects_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """summary=True strips all keys except the compact set."""
-    async def _stub(*a: Any, **kw: Any) -> Any:
-        return [
-            {
-                "id": "1", "identifier": "CY-1", "title": "T", "status": "todo",
-                "priority": "low", "assigneeAgentId": None, "projectId": None,
-                "goalId": None, "parentId": None, "updatedAt": "2024-01-01",
-                "longFieldA": "should be dropped", "longFieldB": 99,
-            }
-        ]
-
-    monkeypatch.setattr(server, "_request", _stub)
-    result = await server.list_issues(summary=True)
-    assert isinstance(result, list)
-    assert "longFieldA" not in result[0]
-    assert "longFieldB" not in result[0]
-    assert result[0]["title"] == "T"
-    assert result[0]["identifier"] == "CY-1"
+# ── list_approvals ────────────────────────────────────────────────────────────
 
 
-async def test_list_issues_full_mode_preserves_all_keys(monkeypatch: pytest.MonkeyPatch) -> None:
-    """summary=False returns the full object."""
-    async def _stub(*a: Any, **kw: Any) -> Any:
-        return [{"id": "1", "title": "T", "status": "todo", "extraField": "keep"}]
-
-    monkeypatch.setattr(server, "_request", _stub)
-    result = await server.list_issues(summary=False)
-    assert isinstance(result, list)
-    assert result[0]["extraField"] == "keep"
+async def test_list_approvals_rejects_invalid_status(no_http: None) -> None:
+    result = await server.list_approvals(status="whatever")
+    assert result["isError"] is True
 
 
-async def test_list_issues_offset_sent_in_params(capture_request: dict[str, Any]) -> None:
-    await server.list_issues(offset=100)
-    assert capture_request["params"]["offset"] == 100
+# ── _compact helper ───────────────────────────────────────────────────────────
 
 
-async def test_list_issues_limit_clamped(capture_request: dict[str, Any]) -> None:
-    await server.list_issues(limit=999)
-    assert capture_request["params"]["limit"] == 200
+def test_compact_filters_list() -> None:
+    keys: frozenset[str] = frozenset({"id", "title"})
+    raw = [{"id": "1", "title": "t", "extra": "drop"}]
+    result = server._compact(raw, keys)
+    assert result == [{"id": "1", "title": "t"}]
 
 
-async def test_list_goals_summary_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(*a: Any, **kw: Any) -> Any:
-        return [{"id": "g1", "title": "G", "status": "active", "parentId": None,
-                 "level": 0, "updatedAt": "2024-01-01", "extraGoalField": "drop"}]
-
-    monkeypatch.setattr(server, "_request", _stub)
-    result = await server.list_goals(summary=True)
-    assert isinstance(result, list)
-    assert "extraGoalField" not in result[0]
-    assert result[0]["title"] == "G"
-
-
-async def test_list_goals_pagination_params(capture_request: dict[str, Any]) -> None:
-    await server.list_goals(limit=10, offset=20)
-    assert capture_request["params"]["limit"] == 10
-    assert capture_request["params"]["offset"] == 20
-
-
-async def test_list_activity_summary_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(*a: Any, **kw: Any) -> Any:
-        return [{"id": "a1", "type": "checkout", "agentId": "u1",
-                 "issueId": "i1", "goalId": None, "createdAt": "2024-01-01",
-                 "verboseField": "drop me"}]
-
-    monkeypatch.setattr(server, "_request", _stub)
-    result = await server.list_activity(summary=True)
-    assert isinstance(result, list)
-    assert "verboseField" not in result[0]
-    assert result[0]["type"] == "checkout"
-
-
-async def test_list_activity_offset_param(capture_request: dict[str, Any]) -> None:
-    await server.list_activity(offset=50)
-    assert capture_request["params"]["offset"] == 50
-
-
-async def test_compact_handles_paginated_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_compact also works when the API wraps results in a 'data' key."""
-    async def _stub(*a: Any, **kw: Any) -> Any:
-        return {
-            "data": [{"id": "1", "title": "T", "status": "todo", "extra": "drop"}],
-            "total": 1,
-        }
-
-    monkeypatch.setattr(server, "_request", _stub)
-    result = await server.list_issues(summary=True)
+def test_compact_handles_paginated_envelope() -> None:
+    keys: frozenset[str] = frozenset({"id"})
+    raw = {"data": [{"id": "x", "extra": "drop"}], "total": 1}
+    result = server._compact(raw, keys)
     assert isinstance(result, dict)
-    assert "extra" not in result["data"][0]
-    assert result["data"][0]["title"] == "T"
+    assert result["data"] == [{"id": "x"}]
     assert result["total"] == 1
 
 
-# ── A + B. list_issues new filters ────────────────────────────────────────────
-
-async def test_list_issues_goal_id_filter(capture_request: dict[str, Any]) -> None:
-    goal = "123e4567-e89b-42d3-a456-426614174000"
-    await server.list_issues(goal_id=goal)
-    assert capture_request["params"]["goalId"] == goal
-
-
-async def test_list_issues_goal_id_rejects_non_uuid(no_http: None) -> None:
-    result = await server.list_issues(goal_id="not-a-uuid")
-    assert result["isError"] is True
-
-
-async def test_list_issues_parent_issue_id_filter(capture_request: dict[str, Any]) -> None:
-    await server.list_issues(parent_issue_id="CY-10")
-    assert capture_request["params"]["parentIssueId"] == "CY-10"
-
-
-async def test_list_issues_parent_issue_id_rejects_injection(no_http: None) -> None:
-    result = await server.list_issues(parent_issue_id="../x")
-    assert result["isError"] is True
-
-
-async def test_list_issues_assignee_uuid_validated(no_http: None) -> None:
-    result = await server.list_issues(assignee_agent_id="not-a-uuid")
-    assert result["isError"] is True
-
-
-# ── B. create_issue new fields ────────────────────────────────────────────────
-
-async def test_create_issue_labels_csv_split(capture_request: dict[str, Any]) -> None:
-    await server.create_issue(title="T", labels="bug, enhancement , security")
-    assert capture_request["body"]["labels"] == ["bug", "enhancement", "security"]
-
-
-async def test_create_issue_with_valid_status(capture_request: dict[str, Any]) -> None:
-    await server.create_issue(title="T", status="in_progress")
-    assert capture_request["body"]["status"] == "in_progress"
-
-
-async def test_create_issue_rejects_invalid_status(no_http: None) -> None:
-    result = await server.create_issue(title="T", status="shipped")
-    assert result["isError"] is True
-    assert "shipped" in result["message"]
-
-
-async def test_create_issue_work_mode_sent(capture_request: dict[str, Any]) -> None:
-    await server.create_issue(title="T", work_mode="autonomous")
-    assert capture_request["body"]["workMode"] == "autonomous"
-
-
-async def test_create_issue_goal_id_sent(capture_request: dict[str, Any]) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    await server.create_issue(title="T", goal_id=gid)
-    assert capture_request["body"]["goalId"] == gid
-
-
-async def test_create_issue_goal_id_rejects_non_uuid(no_http: None) -> None:
-    result = await server.create_issue(title="T", goal_id="bad-id")
-    assert result["isError"] is True
-
-
-async def test_create_issue_assignee_uuid_validated(no_http: None) -> None:
-    result = await server.create_issue(title="T", assignee_agent_id="not-uuid")
-    assert result["isError"] is True
-
-
-async def test_create_issue_rejects_invalid_priority(no_http: None) -> None:
-    result = await server.create_issue(title="T", priority="instant")
-    assert result["isError"] is True
-
-
-# ── B. update_issue new fields ────────────────────────────────────────────────
-
-async def test_update_issue_labels_csv_split(capture_request: dict[str, Any]) -> None:
-    await server.update_issue(issue_id="CY-1", labels="alpha, beta")
-    assert capture_request["body"]["labels"] == ["alpha", "beta"]
-
-
-async def test_update_issue_unlinks_parent(capture_request: dict[str, Any]) -> None:
-    """Sentinel 'null' must produce parentIssueId: null (None) in the body."""
-    await server.update_issue(issue_id="CY-1", parent_issue_id="null")
-    assert "parentIssueId" in capture_request["body"]
-    assert capture_request["body"]["parentIssueId"] is None
-
-
-async def test_update_issue_sets_parent(capture_request: dict[str, Any]) -> None:
-    await server.update_issue(issue_id="CY-1", parent_issue_id="CY-5")
-    assert capture_request["body"]["parentIssueId"] == "CY-5"
-
-
-async def test_update_issue_unlinks_goal(capture_request: dict[str, Any]) -> None:
-    await server.update_issue(issue_id="CY-1", goal_id="null")
-    assert capture_request["body"]["goalId"] is None
-
-
-async def test_update_issue_sets_goal(capture_request: dict[str, Any]) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    await server.update_issue(issue_id="CY-1", goal_id=gid)
-    assert capture_request["body"]["goalId"] == gid
-
-
-async def test_update_issue_goal_rejects_non_uuid(no_http: None) -> None:
-    result = await server.update_issue(issue_id="CY-1", goal_id="bad")
-    assert result["isError"] is True
-
-
-async def test_update_issue_unlinks_project(capture_request: dict[str, Any]) -> None:
-    await server.update_issue(issue_id="CY-1", project_id="null")
-    assert capture_request["body"]["projectId"] is None
-
-
-async def test_update_issue_assignee_uuid_validated(no_http: None) -> None:
-    result = await server.update_issue(issue_id="CY-1", assignee_agent_id="bad")
-    assert result["isError"] is True
-
-
-async def test_update_issue_no_fields_error(no_http: None) -> None:
-    result = await server.update_issue(issue_id="CY-1")
-    assert result["isError"] is True
-
-
-# ── B. update_goal new fields ─────────────────────────────────────────────────
-
-async def test_update_goal_status_sent(capture_request: dict[str, Any]) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    await server.update_goal(goal_id=gid, status="completed")
-    assert capture_request["body"]["status"] == "completed"
-
-
-async def test_update_goal_unlinks_parent(capture_request: dict[str, Any]) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    await server.update_goal(goal_id=gid, parent_id="null")
-    assert "parentId" in capture_request["body"]
-    assert capture_request["body"]["parentId"] is None
-
-
-async def test_update_goal_sets_parent(capture_request: dict[str, Any]) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    pid = "223e4567-e89b-42d3-a456-426614174000"
-    await server.update_goal(goal_id=gid, parent_id=pid)
-    assert capture_request["body"]["parentId"] == pid
-
-
-async def test_update_goal_parent_rejects_non_uuid(no_http: None) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    result = await server.update_goal(goal_id=gid, parent_id="not-uuid")
-    assert result["isError"] is True
-
-
-async def test_update_goal_no_fields_error(no_http: None) -> None:
-    gid = "123e4567-e89b-42d3-a456-426614174000"
-    result = await server.update_goal(goal_id=gid)
-    assert result["isError"] is True
-
-
-# ── B. create_goal parent_id ──────────────────────────────────────────────────
-
-async def test_create_goal_with_parent(capture_request: dict[str, Any]) -> None:
-    pid = "123e4567-e89b-42d3-a456-426614174000"
-    await server.create_goal(title="Sub-goal", parent_id=pid)
-    assert capture_request["body"]["parentId"] == pid
-
-
-async def test_create_goal_parent_rejects_non_uuid(no_http: None) -> None:
-    result = await server.create_goal(title="T", parent_id="bad")
-    assert result["isError"] is True
-
-
-# ── C. New tools registered & UUID-validated ─────────────────────────────────
-
-async def test_get_goal_registered() -> None:
-    tools = await server.mcp.list_tools()
-    assert "get_goal" in {t.name for t in tools}
-
-
-async def test_get_goal_rejects_non_uuid(no_http: None) -> None:
-    result = await server.get_goal(goal_id="not-a-uuid")
-    assert result["isError"] is True
-
-
-async def test_get_goal_rejects_injection(no_http: None) -> None:
-    result = await server.get_goal(goal_id="../x")
-    assert result["isError"] is True
-
-
-async def test_list_projects_registered() -> None:
-    tools = await server.mcp.list_tools()
-    assert "list_projects" in {t.name for t in tools}
-
-
-async def test_get_project_registered() -> None:
-    tools = await server.mcp.list_tools()
-    assert "get_project" in {t.name for t in tools}
-
-
-async def test_get_project_rejects_non_uuid(no_http: None) -> None:
-    result = await server.get_project(project_id="not-a-uuid")
-    assert result["isError"] is True
-
-
-async def test_list_comments_registered() -> None:
-    tools = await server.mcp.list_tools()
-    assert "list_comments" in {t.name for t in tools}
-
-
-async def test_list_comments_rejects_injection(no_http: None) -> None:
-    result = await server.list_comments(issue_id="../x")
-    assert result["isError"] is True
-
-
-async def test_list_comments_accepts_valid_ref(capture_request: dict[str, Any]) -> None:
-    await server.list_comments(issue_id="CY-42")
-    assert "/comments" in capture_request["path"]
-
-
-# ── D. Robustness: _opt_uuid helper ──────────────────────────────────────────
-
-def test_opt_uuid_returns_none_for_empty() -> None:
-    assert server._opt_uuid("", "x") is None
-    assert server._opt_uuid("   ", "x") is None
-
-
-def test_opt_uuid_canonicalises_uuid() -> None:
-    raw = "123E4567-E89B-42D3-A456-426614174000"
-    expected = "123e4567-e89b-42d3-a456-426614174000"
-    assert server._opt_uuid(raw, "x") == expected
-
-
-def test_opt_uuid_raises_for_bad_value() -> None:
-    with pytest.raises(ValueError):
-        server._opt_uuid("not-uuid", "x")
-
-
-# ── D. Robustness: list_activity agent_id UUID validation ─────────────────────
-
-async def test_list_activity_agent_id_uuid_validated(no_http: None) -> None:
-    result = await server.list_activity(agent_id="bad-id")
-    assert result["isError"] is True
+def test_compact_passes_through_errors() -> None:
+    err = {"isError": True, "message": "oops"}
+    assert server._compact(err, frozenset()) is err

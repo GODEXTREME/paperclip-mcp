@@ -17,6 +17,35 @@ Exposes Paperclip's REST API as [Model Context Protocol](https://modelcontextpro
 | **Approvals** | `list_approvals` · `approve` · `reject` · `request_approval_revision` |
 | **Monitoring** | `get_cost_summary` · `get_dashboard` · `list_activity` |
 
+### Hierarchy & linkage
+
+Goals and issues can be organized into a hierarchy so work traces back to the mission:
+
+- `create_goal` / `update_goal` accept **`parent_id`** (nest a goal under another goal) and
+  **`level`**. `create_goal` also accepts **`project_id`**.
+- `create_issue` / `update_issue` accept **`goal_id`**, **`project_id`** and
+  **`parent_issue_id`** — link an issue to a specific goal, move it between projects, or
+  re-parent it.
+
+To **unlink** a relationship, pass the literal string `"null"` as the value:
+
+```
+update_issue(issue_id="CY-42", goal_id="null")     # removes goal link
+update_goal(goal_id="...", parent_id="null")        # makes goal top-level
+```
+
+### Pagination & compact mode
+
+`list_issues`, `list_goals`, and `list_activity` accept **`limit`** and **`offset`** for
+cursor-free pagination. Pass **`summary=True`** to project each item down to its most-used
+fields — useful when listing large collections to stay within context limits:
+
+```
+list_issues(limit=200, offset=0, summary=True)   # ~580 KB → ~30 KB
+```
+
+All id parameters are validated as UUIDs before the request is sent.
+
 ---
 
 ## Requirements
@@ -75,17 +104,6 @@ MCP_AUTH_TOKEN=your_generated_token_here       # required for HTTP transports
   MCP server must present it as `Authorization: Bearer <token>`. The server **refuses to
   start** over HTTP without it (stdio does not need it).
 
-### API key scope and 403 errors
-
-`PAPERCLIP_API_KEY` is bound to a specific Paperclip **agent** persona. That agent's
-authorization boundary controls which issues it can read and modify. If you see 403
-errors when commenting on or updating issues owned by other agents or projects, the
-key belongs to an agent with a narrow scope.
-
-**Fix**: generate the API key using a company-admin or CEO agent persona —
-one that has company-wide write access. Go to Paperclip UI → Settings → API Keys,
-select the admin agent as the key owner, and regenerate.
-
 ---
 
 ## Usage
@@ -143,14 +161,8 @@ Once registered, you can ask your AI assistant:
 "What tasks does the Purchasing agent have open?"
 → calls list_issues(assignee_agent_id="...", status="todo,in_progress")
 
-"List all issues for goal X, page 2 (next 50 after the first 50)"
-→ calls list_issues(goal_id="...", limit=50, offset=50)
-
 "Create a task for the CEO agent to search for new cheese suppliers in Barcelona"
 → calls create_issue(title="Search cheese suppliers in Barcelona", assignee_agent_id="...")
-
-"Move issue CY-10 to goal X and remove it from its current project"
-→ calls update_issue(issue_id="CY-10", goal_id="<uuid>", project_id="null")
 
 "Approve the pending hire request"
 → calls list_approvals(status="pending") + approve(approval_id="...")
@@ -160,32 +172,6 @@ Once registered, you can ask your AI assistant:
 
 "Wake up the Administration agent now"
 → calls invoke_agent_heartbeat(agent_id="...")
-
-"Show me the comments on issue CY-42"
-→ calls list_comments(issue_id="CY-42")
-```
-
-### Pagination
-
-`list_issues`, `list_goals`, and `list_activity` all support `limit` and `offset` for
-pagination, and a `summary` flag (default `True`) that projects each item to its key
-fields only — reducing a 200-issue response from ~580 KB to ~30 KB.
-
-```
-list_issues(limit=50, offset=0)   # first page
-list_issues(limit=50, offset=50)  # second page
-list_issues(summary=False)        # full objects (use sparingly)
-```
-
-### Unlinking relationships
-
-Pass the literal string `"null"` to remove a link without providing a new one:
-
-```
-update_issue(issue_id="CY-1", parent_issue_id="null")  # detach subtask
-update_issue(issue_id="CY-1", goal_id="null")           # unlink from goal
-update_issue(issue_id="CY-1", project_id="null")        # remove from project
-update_goal(goal_id="...", parent_id="null")             # promote to top-level
 ```
 
 ---

@@ -47,9 +47,9 @@
       "list_agents", "get_agent", "invoke_agent_heartbeat",
       "list_goals", "get_goal", "create_goal", "update_goal",
       "list_projects", "get_project",
-      "list_comments",
       "list_approvals", "approve", "reject", "request_approval_revision",
-      "get_cost_summary", "get_dashboard", "list_activity"
+      "get_cost_summary", "get_dashboard", "list_activity",
+      "list_comments"
     ]
   }
 }
