@@ -156,6 +156,20 @@ def _issue_ref(value: str, name: str = "issue_id") -> str:
     return _path_param(value, name)
 
 
+def _opt_uuid(value: str, name: str) -> str | None:
+    """Validate an optional UUID-by-contract body parameter.
+
+    Returns the canonical UUID string, or None when the value is blank (the
+    field is simply omitted from the request body). Raises ValueError if a
+    non-empty value is not a valid UUID — surfaced to the caller as a clear
+    error instead of a downstream API rejection.
+    """
+    value = value.strip()
+    if not value:
+        return None
+    return _uuid_param(value, name)
+
+
 async def _request(
     method: str,
     path: str,
@@ -432,6 +446,7 @@ async def create_issue(
     assignee_agent_id: str = "",
     project_id: str = "",
     parent_issue_id: str = "",
+    goal_id: str = "",
     priority: str = "medium",
 ) -> Any:
     """Create a new issue (task) and optionally assign it to an agent.
@@ -445,17 +460,29 @@ async def create_issue(
         project_id: UUID of the project this issue belongs to. Leave empty for no project.
         parent_issue_id: UUID of the parent issue when creating a subtask.
                          Leave empty for top-level.
+        goal_id: UUID of the goal this issue should be linked to. Leave empty to inherit
+                 the goal from the project (if any).
         priority: Task priority — urgent, high, medium, or low. Default: medium.
     """
+    if priority not in ISSUE_PRIORITIES:
+        return _err(
+            f"Invalid priority '{priority}'. Allowed: {', '.join(sorted(ISSUE_PRIORITIES))}."
+        )
     body: dict[str, Any] = {"title": title, "priority": priority}
     if description:
         body["description"] = description
-    if assignee_agent_id:
-        body["assigneeAgentId"] = assignee_agent_id
-    if project_id:
-        body["projectId"] = project_id
-    if parent_issue_id:
-        body["parentIssueId"] = parent_issue_id
+    try:
+        for field, value in (
+            ("assigneeAgentId", assignee_agent_id),
+            ("projectId", project_id),
+            ("parentIssueId", parent_issue_id),
+            ("goalId", goal_id),
+        ):
+            canonical = _opt_uuid(value, field)
+            if canonical is not None:
+                body[field] = canonical
+    except ValueError as exc:
+        return _err(str(exc))
     return await _post(f"/companies/{COMPANY}/issues", body)
 
 
@@ -467,6 +494,9 @@ async def update_issue(
     status: str = "",
     assignee_agent_id: str = "",
     priority: str = "",
+    project_id: str = "",
+    parent_issue_id: str = "",
+    goal_id: str = "",
 ) -> Any:
     """Update an existing issue. Only fields you provide are changed.
 
@@ -478,6 +508,9 @@ async def update_issue(
                 Leave empty to keep current.
         assignee_agent_id: New agent UUID. Leave empty to keep current assignee.
         priority: New priority — urgent, high, medium, or low. Leave empty to keep current.
+        project_id: Move the issue to this project UUID. Leave empty to keep current project.
+        parent_issue_id: Re-parent the issue under this issue UUID. Leave empty to keep current.
+        goal_id: Link the issue to this goal UUID. Leave empty to keep current goal.
     """
     try:
         ref = _issue_ref(issue_id)
@@ -502,10 +535,21 @@ async def update_issue(
                 f"Invalid priority '{priority}'. Allowed: {', '.join(sorted(ISSUE_PRIORITIES))}."
             )
         body["priority"] = priority
+    try:
+        for field, value in (
+            ("projectId", project_id),
+            ("parentIssueId", parent_issue_id),
+            ("goalId", goal_id),
+        ):
+            canonical = _opt_uuid(value, field)
+            if canonical is not None:
+                body[field] = canonical
+    except ValueError as exc:
+        return _err(str(exc))
     if not body:
         return _err(
-            "No fields to update. Provide at least one of: "
-            "title, description, status, assignee_agent_id, priority."
+            "No fields to update. Provide at least one of: title, description, status, "
+            "assignee_agent_id, priority, project_id, parent_issue_id, goal_id."
         )
     return await _patch(f"/issues/{ref}", body)
 
@@ -619,19 +663,42 @@ async def list_goals() -> Any:
 
 
 @mcp.tool()
-async def create_goal(title: str, description: str = "") -> Any:
+async def create_goal(
+    title: str,
+    description: str = "",
+    parent_id: str = "",
+    level: str = "",
+    project_id: str = "",
+) -> Any:
     """Create a new strategic goal for the active company.
 
     Goals provide high-level direction to agents. They appear in agent context
-    so agents can align their work accordingly.
+    so agents can align their work accordingly. Goals can be nested: pass
+    parent_id to create a sub-goal under an existing goal, so work traces back
+    up to the parent objective.
 
     Args:
         title: Goal title (e.g. "Reach 300 packs/month in sales by June 2026").
         description: Extended context, success criteria, and constraints (Markdown supported).
+        parent_id: UUID of the parent goal to nest this goal under. Leave empty for top-level.
+        level: Optional hierarchy level for this goal (values defined by the Paperclip
+               API, e.g. company/objective/project/task). Leave empty for the API default.
+        project_id: UUID of the project to attach this goal to. Leave empty for none.
     """
     body: dict[str, Any] = {"title": title}
     if description:
         body["description"] = description
+    if level.strip():
+        body["level"] = level.strip()
+    try:
+        parent = _opt_uuid(parent_id, "parent_id")
+        if parent is not None:
+            body["parentId"] = parent
+        project = _opt_uuid(project_id, "project_id")
+        if project is not None:
+            body["projectId"] = project
+    except ValueError as exc:
+        return _err(str(exc))
     return await _post(f"/companies/{COMPANY}/goals", body)
 
 
@@ -640,13 +707,23 @@ async def update_goal(
     goal_id: str,
     title: str = "",
     description: str = "",
+    parent_id: str = "",
+    level: str = "",
 ) -> Any:
-    """Update an existing goal's title or description.
+    """Update an existing goal's title, description, parent, or level.
+
+    Pass parent_id to nest this goal under another goal (e.g. attach a project
+    goal under the company mission) so results roll up the hierarchy. Only the
+    fields you provide are changed.
 
     Args:
         goal_id: Goal UUID.
         title: New title. Leave empty to keep current.
         description: New description. Leave empty to keep current.
+        parent_id: UUID of the new parent goal to nest this goal under. Leave empty to
+                   keep the current parent.
+        level: New hierarchy level (values defined by the Paperclip API,
+               e.g. company/objective/project/task). Leave empty to keep current.
     """
     try:
         ref = _uuid_param(goal_id, "goal_id")
@@ -657,8 +734,19 @@ async def update_goal(
         body["title"] = title
     if description:
         body["description"] = description
+    if level.strip():
+        body["level"] = level.strip()
+    try:
+        parent = _opt_uuid(parent_id, "parent_id")
+        if parent is not None:
+            body["parentId"] = parent
+    except ValueError as exc:
+        return _err(str(exc))
     if not body:
-        return _err("No fields to update. Provide at least one of: title, description.")
+        return _err(
+            "No fields to update. Provide at least one of: "
+            "title, description, parent_id, level."
+        )
     return await _patch(f"/goals/{ref}", body)
 
 

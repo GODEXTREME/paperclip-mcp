@@ -16,6 +16,18 @@ Exposes Paperclip's REST API as [Model Context Protocol](https://modelcontextpro
 | **Approvals** | `list_approvals` · `approve` · `reject` · `request_approval_revision` |
 | **Monitoring** | `get_cost_summary` · `get_dashboard` · `list_activity` |
 
+### Hierarchy & linkage
+
+Goals and issues can be organized into a hierarchy so work traces back to the mission:
+
+- `create_goal` / `update_goal` accept **`parent_id`** (nest a goal under another goal) and
+  **`level`**. `create_goal` also accepts **`project_id`**.
+- `create_issue` / `update_issue` accept **`goal_id`**, **`project_id`** and
+  **`parent_issue_id`** — link an issue to a specific goal, move it between projects, or
+  re-parent it. (`create_issue` already validates `priority`.)
+
+All id parameters are validated as UUIDs before the request is sent.
+
 ---
 
 ## Requirements
