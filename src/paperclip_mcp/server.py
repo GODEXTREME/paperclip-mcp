@@ -17,6 +17,10 @@ Configuration (environment variables):
     MCP_AUTH_TOKEN         Required for HTTP transports. Bearer token MCP
                            clients must present; generate with
                            `openssl rand -hex 32`. Not used by stdio.
+    MCP_PUBLIC_URL         Optional. Public HTTPS base URL of this server
+                           (e.g. https://paperclip-mcp.example.com). When
+                           set, enables full OAuth 2.0 support for Claude
+                           web alongside the existing static bearer token.
 """
 
 from __future__ import annotations
@@ -36,6 +40,9 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
+from mcp.server.auth.settings import ClientRegistrationOptions
+from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -50,6 +57,7 @@ except ImportError:
 BASE_URL: str = os.environ.get("PAPERCLIP_BASE_URL", "http://localhost:3100/api").rstrip("/")
 API_KEY: str  = os.environ.get("PAPERCLIP_API_KEY", "")
 COMPANY: str  = os.environ.get("PAPERCLIP_COMPANY_ID", "")
+MCP_PUBLIC_URL: str = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -277,6 +285,45 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 
 
 # ── HTTP transport authentication ──────────────────────────────────────────────
+
+OAUTH_CLIENT_ID = "paperclip-mcp-client"
+
+
+class PaperclipAuthProvider(InMemoryOAuthProvider):
+    """Combined OAuth 2.0 + static bearer token auth provider.
+
+    When MCP_PUBLIC_URL is set, use this instead of StaticBearerVerifier:
+    - Claude.ai web: full OAuth authorization code flow
+        client_id     = "paperclip-mcp-client"
+        client_secret = MCP_AUTH_TOKEN
+    - CLI / Claude Desktop: static bearer token (MCP_AUTH_TOKEN in the
+        Authorization header) — unchanged, continues working.
+
+    The static token is pre-loaded as a non-expiring access token in the
+    InMemoryOAuthProvider's store, so both code paths share one validator.
+    """
+
+    def __init__(self, token: str, public_url: str) -> None:
+        super().__init__(
+            base_url=public_url,
+            client_registration_options=ClientRegistrationOptions(enabled=False),
+        )
+        # Pre-register the OAuth client for Claude.ai web (secret = MCP_AUTH_TOKEN).
+        self.clients[OAUTH_CLIENT_ID] = OAuthClientInformationFull(
+            client_id=OAUTH_CLIENT_ID,
+            client_secret=token,
+            redirect_uris=[],   # AuthorizationHandler validates; empty = accept any
+            grant_types=["authorization_code"],
+            response_types=["code"],
+        )
+        # Pre-load the static bearer token — expires_at=None means it never expires.
+        self.access_tokens[token] = AccessToken(
+            token=token,
+            client_id="static-bearer",
+            scopes=[],
+            expires_at=None,
+        )
+
 
 class StaticBearerVerifier(TokenVerifier):
     """FastMCP TokenVerifier backed by a single static secret (MCP_AUTH_TOKEN).
@@ -773,7 +820,13 @@ def main() -> None:
             args.port,
         )
         sys.exit(1)
-    mcp.auth = StaticBearerVerifier(token)
+    if MCP_PUBLIC_URL:
+        # OAuth 2.0 (Claude.ai web) + static bearer (CLI/Desktop) — both active.
+        log.info("OAuth enabled — client_id: %s | public_url: %s", OAUTH_CLIENT_ID, MCP_PUBLIC_URL)
+        mcp.auth = PaperclipAuthProvider(token, MCP_PUBLIC_URL)
+    else:
+        # Static bearer only — no OAuth discovery, simpler for LAN-only setups.
+        mcp.auth = StaticBearerVerifier(token)
     mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 

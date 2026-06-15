@@ -33,6 +33,11 @@
       "description": "Bearer token required by HTTP transports (streamable-http/sse). The server refuses to start over HTTP without it; not used by stdio. Generate with: openssl rand -hex 32.",
       "required": true,
       "secret": true
+    },
+    "MCP_PUBLIC_URL": {
+      "description": "Public HTTPS base URL of this server (e.g. https://paperclip-mcp.example.com). Required for Claude.ai web OAuth support. When set, enables OAuth 2.0 alongside the existing static bearer token. OAuth client_id: paperclip-mcp-client; client_secret: same as MCP_AUTH_TOKEN.",
+      "required": false,
+      "secret": false
     }
   },
   "capabilities": {
