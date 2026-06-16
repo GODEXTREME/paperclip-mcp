@@ -1,11 +1,13 @@
-name: Auto-tag on version bump
+name: Auto-version on merge to master
 
 on:
   push:
     branches: [master]
 
 jobs:
-  tag:
+  version:
+    # Prevent infinite loop: skip if the bot itself pushed
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -13,27 +15,52 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Read version from pyproject.toml
-        id: ver
-        run: |
-          VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Skip if tag already exists
-        id: check
+      - name: Install hatch
+        run: pip install hatch
+
+      - name: Determine bump type from conventional commits
+        id: bump
         run: |
-          if git rev-parse "refs/tags/v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          # Find the last tag; if none exists, use the first commit
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
+
+          echo "Commits since $LAST_TAG:"
+          git log "${LAST_TAG}..HEAD" --oneline
+
+          BUMP="patch"
+
+          # Check for breaking changes first (highest priority)
+          if git log "${LAST_TAG}..HEAD" --pretty="%s %b" | grep -qE '(^feat!:|^fix!:|^refactor!:|BREAKING[[:space:]]CHANGE)'; then
+            BUMP="major"
+          # Then check for new features
+          elif git log "${LAST_TAG}..HEAD" --pretty="%s" | grep -qE '^feat(\(.+\))?!?:'; then
+            BUMP="minor"
           fi
 
-      - name: Create and push tag
-        if: steps.check.outputs.exists == 'false'
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Bump type: $BUMP"
+
+      - name: Bump version with hatch
+        id: ver
+        run: |
+          hatch version ${{ steps.bump.outputs.bump }}
+          NEW_VERSION=$(hatch version)
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "New version: $NEW_VERSION"
+
+      - name: Commit and tag
         run: |
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
+          git add pyproject.toml
+          git commit -m "chore: bump version to ${{ steps.ver.outputs.version }}"
           git tag -a "v${{ steps.ver.outputs.version }}" \
             -m "Release v${{ steps.ver.outputs.version }}"
+          git push origin master
           git push origin "v${{ steps.ver.outputs.version }}"
