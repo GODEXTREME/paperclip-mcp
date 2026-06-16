@@ -507,14 +507,31 @@ class StaticBearerVerifier(TokenVerifier):  # type: ignore[misc]
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
 
+_SERVER_VERSION = "0.2.0"
+
 mcp = FastMCP(
     name="paperclip",
     instructions=(
-        "Manage a Paperclip AI agent orchestration platform. "
-        "Use these tools to create and track issues (tasks), inspect agents, "
-        "set goals, handle approvals, and monitor costs. "
-        "All operations target a single Paperclip company configured via "
-        "PAPERCLIP_COMPANY_ID."
+        "You are connected to paperclip-mcp v0.2.0 — an MCP server for the Paperclip "
+        "AI agent orchestration platform.\n\n"
+        "TOOL CATEGORIES\n"
+        "  Issues   : list_issues, get_issue, create_issue, update_issue,\n"
+        "             checkout_issue, release_issue, comment_on_issue, list_comments\n"
+        "  Agents   : list_agents, get_agent, invoke_agent_heartbeat\n"
+        "  Goals    : list_goals, get_goal, create_goal, update_goal\n"
+        "  Projects : list_projects, get_project\n"
+        "  Approvals: list_approvals, approve, reject, request_approval_revision\n"
+        "  Monitor  : get_cost_summary, get_dashboard, list_activity\n"
+        "  Meta     : get_server_info\n\n"
+        "KEY BEHAVIOURS (v0.2.0)\n"
+        "  • All list_* tools return compact fields by default (full=True for raw).\n"
+        "    list_agents strips systemPrompt/config — huge fields not needed for most tasks.\n"
+        "  • Pagination: list_issues/list_goals/list_activity accept limit + offset.\n"
+        '  • Unlink relations: pass "null" (string) to goal_id/project_id/parent_id\n'
+        "    in update_issue or update_goal to detach the relationship.\n"
+        "  • UUID validation: all id params are validated before the request is sent.\n"
+        "  • 401 → API key hint, 403 → authorization boundary hint, 404 → resource hint.\n\n"
+        "Call get_server_info() for a full structured reference."
     ),
     lifespan=_lifespan,
 )
@@ -528,6 +545,114 @@ async def _healthz(_request: Request) -> JSONResponse:
     a constant payload — no configuration, versions, or state.
     """
     return JSONResponse({"ok": True})
+
+
+# ── META ───────────────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_server_info() -> Any:
+    """Return version, tool catalogue, and usage tips for this MCP server.
+
+    Call this when you need a structured reference of what tools are available
+    and how key features work (compact mode, pagination, null sentinels, etc.).
+    No API request is made — the response is generated locally.
+    """
+    return {
+        "version": _SERVER_VERSION,
+        "server": "paperclip-mcp",
+        "tools": {
+            "issues": [
+                "list_issues",
+                "get_issue",
+                "create_issue",
+                "update_issue",
+                "checkout_issue",
+                "release_issue",
+                "comment_on_issue",
+                "list_comments",
+            ],
+            "agents": ["list_agents", "get_agent", "invoke_agent_heartbeat"],
+            "goals": ["list_goals", "get_goal", "create_goal", "update_goal"],
+            "projects": ["list_projects", "get_project"],
+            "approvals": [
+                "list_approvals",
+                "approve",
+                "reject",
+                "request_approval_revision",
+            ],
+            "monitoring": ["get_cost_summary", "get_dashboard", "list_activity"],
+            "meta": ["get_server_info"],
+        },
+        "features": {
+            "compact_mode": (
+                "All list_* tools return only essential fields by default. "
+                "Pass full=True to get the raw API response. "
+                "list_agents omits systemPrompt and config (large fields)."
+            ),
+            "pagination": (
+                "list_issues, list_goals, list_activity accept limit (max 200/100) "
+                "and offset for page-by-page retrieval."
+            ),
+            "null_sentinel": (
+                'Pass the string "null" to goal_id, project_id, or parent_issue_id '
+                "in update_issue, or to parent_id in update_goal, to unlink/detach "
+                "the relationship (sends JSON null to the API)."
+            ),
+            "uuid_validation": (
+                "All UUID parameters are validated client-side before the request is "
+                "sent. Path parameters use strict encoding to prevent injection."
+            ),
+            "error_hints": (
+                "HTTP 401 returns an API key hint. "
+                "HTTP 403 returns an authorization boundary hint. "
+                "HTTP 404 returns a resource-not-found hint."
+            ),
+            "hierarchy": (
+                "Issues and goals can be nested: use parent_issue_id / parent_id. "
+                "Issues link to goals via goal_id. "
+                "Goals link to projects via project_id."
+            ),
+        },
+        "compact_fields": {
+            "list_issues": [
+                "id",
+                "identifier",
+                "title",
+                "status",
+                "priority",
+                "assigneeAgentId",
+                "projectId",
+                "goalId",
+                "parentId",
+                "labels",
+                "updatedAt",
+            ],
+            "list_goals": ["id", "title", "status", "parentId", "level", "projectId", "updatedAt"],
+            "list_agents": ["id", "name", "role", "status", "model", "createdAt", "updatedAt"],
+            "list_approvals": [
+                "id",
+                "type",
+                "status",
+                "issueId",
+                "goalId",
+                "requestedByAgentId",
+                "createdAt",
+                "updatedAt",
+            ],
+            "list_projects": ["id", "name", "status", "goalId", "createdAt", "updatedAt"],
+            "list_comments": ["id", "body", "authorAgentId", "createdAt", "updatedAt"],
+            "list_activity": [
+                "id",
+                "type",
+                "agentId",
+                "issueId",
+                "goalId",
+                "description",
+                "createdAt",
+            ],
+        },
+    }
 
 
 # ── ISSUES ─────────────────────────────────────────────────────────────────────
