@@ -3,6 +3,7 @@ name: Build & push image
 on:
   push:
     branches: [master]
+    tags: ["v*"]
 
 jobs:
   build:
@@ -12,13 +13,25 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/godextreme/paperclip-mcp
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ghcr.io/godextreme/paperclip-mcp:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
