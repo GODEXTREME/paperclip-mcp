@@ -1,16 +1,17 @@
-name: Auto-version on merge to master
+name: Release
 
 on:
   push:
     branches: [master]
 
 jobs:
-  version:
+  release:
     # Prevent infinite loop: skip if the bot itself pushed
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,3 +94,18 @@ jobs:
             -m "Release v${{ steps.ver.outputs.version }}"
           git push origin master
           git push origin "v${{ steps.ver.outputs.version }}"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/godextreme/paperclip-mcp:${{ steps.ver.outputs.version }}
+            ghcr.io/godextreme/paperclip-mcp:latest
+          labels: org.opencontainers.image.version=${{ steps.ver.outputs.version }}

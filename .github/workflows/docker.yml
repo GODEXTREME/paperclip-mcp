@@ -1,6 +1,11 @@
-name: Build & push image
+name: Build & push image (manual)
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push (e.g. 0.3.0)"
+        required: true
   push:
     tags: ["v*"]
 
