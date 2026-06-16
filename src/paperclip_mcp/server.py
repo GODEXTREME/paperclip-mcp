@@ -508,7 +508,12 @@ class StaticBearerVerifier(TokenVerifier):  # type: ignore[misc]
 
 # ── MCP Server ─────────────────────────────────────────────────────────────────
 
-_SERVER_VERSION = "0.2.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    _SERVER_VERSION = _pkg_version("paperclip-mcp")
+except Exception:
+    _SERVER_VERSION = "dev"
 
 mcp = FastMCP(
     name="paperclip",
