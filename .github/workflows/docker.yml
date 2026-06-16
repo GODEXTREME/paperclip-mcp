@@ -2,7 +2,6 @@ name: Build & push image
 
 on:
   push:
-    branches: [master]
     tags: ["v*"]
 
 jobs:
@@ -21,7 +20,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
 
       - uses: docker/login-action@v3
         with:
