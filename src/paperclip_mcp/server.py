@@ -429,7 +429,8 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
     _validate_config()
     _http_client = _build_http_client()
     log.info(
-        "paperclip-mcp started — base: %s | company: %s | api key: %s (masked)",
+        "paperclip-mcp v%s started — base: %s | company: %s | api key: %s (masked)",
+        _SERVER_VERSION,
         BASE_URL,
         COMPANY,
         _mask_key(API_KEY),
