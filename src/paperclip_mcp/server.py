@@ -246,12 +246,13 @@ async def _patch(path: str, body: dict[str, Any]) -> Any:
     return await _request("PATCH", path, body=body)
 
 
-# ── Summary projection ─────────────────────────────────────────────────────────
+# ── Compact projection ─────────────────────────────────────────────────────────
 #
-# summary=True returns only the most-used fields, keeping responses compact when
-# listing large collections (200 issues ≈ 580 KB raw → ~30 KB summarized).
+# All list_* tools apply a compact projection by default: only the most useful
+# fields are returned. Pass full=True to get the raw API response.
+# (200 issues raw ≈ 580 KB; compact ≈ 30 KB — ~20× smaller.)
 
-_ISSUE_SUMMARY_KEYS: frozenset[str] = frozenset(
+_ISSUE_KEYS: frozenset[str] = frozenset(
     {
         "id",
         "identifier",
@@ -262,28 +263,87 @@ _ISSUE_SUMMARY_KEYS: frozenset[str] = frozenset(
         "projectId",
         "goalId",
         "parentId",
+        "labels",
         "updatedAt",
     }
 )
-_GOAL_SUMMARY_KEYS: frozenset[str] = frozenset(
+_GOAL_KEYS: frozenset[str] = frozenset(
     {
         "id",
         "title",
         "status",
         "parentId",
         "level",
+        "projectId",
         "updatedAt",
     }
 )
-_ACTIVITY_SUMMARY_KEYS: frozenset[str] = frozenset(
+_ACTIVITY_KEYS: frozenset[str] = frozenset(
     {
         "id",
         "type",
         "agentId",
         "issueId",
         "goalId",
+        "description",
         "createdAt",
     }
+)
+_AGENT_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "name",
+        "role",
+        "status",
+        "model",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_APPROVAL_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "type",
+        "status",
+        "issueId",
+        "goalId",
+        "requestedByAgentId",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_PROJECT_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "name",
+        "status",
+        "goalId",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_COMMENT_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "body",
+        "authorAgentId",
+        "createdAt",
+        "updatedAt",
+    }
+)
+
+# Envelope keys Paperclip may wrap list payloads in (checked in order).
+_ENVELOPE_KEYS = (
+    "data",
+    "issues",
+    "goals",
+    "agents",
+    "approvals",
+    "projects",
+    "comments",
+    "activity",
+    "results",
+    "items",
 )
 
 
@@ -300,7 +360,7 @@ def _compact(raw: Any, keys: frozenset[str]) -> Any:
     if isinstance(raw, list):
         return [_proj(i) for i in raw]
     if isinstance(raw, dict):
-        for k in ("data", "issues", "goals", "activity", "results", "items"):
+        for k in _ENVELOPE_KEYS:
             if k in raw and isinstance(raw[k], list):
                 return {**raw, k: [_proj(i) for i in raw[k]]}
     return raw
@@ -483,9 +543,13 @@ async def list_issues(
     label: str = "",
     limit: int = 50,
     offset: int = 0,
-    summary: bool = False,
+    full: bool = False,
 ) -> Any:
     """List issues (tasks) in the active company.
+
+    Returns a compact view by default (id, identifier, title, status, priority,
+    assigneeAgentId, projectId, goalId, parentId, labels, updatedAt). Pass
+    full=True to receive the complete raw API response.
 
     Args:
         status: Comma-separated issue statuses to include.
@@ -498,8 +562,7 @@ async def list_issues(
         label: Label name to filter by. Leave empty to skip label filtering.
         limit: Maximum number of results to return (1–200). Default: 50.
         offset: Number of results to skip for pagination. Default: 0.
-        summary: If true, each issue is projected to 10 key fields only (~20× smaller).
-                 Useful when listing large result sets to stay within context limits.
+        full: If true, return the raw API response instead of the compact view.
     """
     statuses = [s.strip() for s in status.split(",") if s.strip()]
     invalid = sorted(set(statuses) - ISSUE_STATUSES)
@@ -531,9 +594,7 @@ async def list_issues(
     if label:
         params["label"] = label
     result = await _get(f"/companies/{COMPANY}/issues", params)
-    if summary:
-        return _compact(result, _ISSUE_SUMMARY_KEYS)
-    return result
+    return result if full else _compact(result, _ISSUE_KEYS)
 
 
 @mcp.tool()
@@ -755,26 +816,40 @@ async def comment_on_issue(
 
 
 @mcp.tool()
-async def list_comments(issue_id: str) -> Any:
+async def list_comments(issue_id: str, full: bool = False) -> Any:
     """List all comments on an issue, in chronological order.
+
+    Returns a compact view by default (id, body, authorAgentId, createdAt,
+    updatedAt). Pass full=True for the raw API response.
 
     Args:
         issue_id: Issue UUID or human-readable identifier (e.g. "CY-42").
+        full: If true, return the raw API response instead of the compact view.
     """
     try:
         ref = _issue_ref(issue_id)
     except ValueError as exc:
         return _err(str(exc))
-    return await _get(f"/issues/{ref}/comments")
+    result = await _get(f"/issues/{ref}/comments")
+    return result if full else _compact(result, _COMMENT_KEYS)
 
 
 # ── AGENTS ─────────────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
-async def list_agents() -> Any:
-    """List all agents in the active company with their name, role, status, and config."""
-    return await _get(f"/companies/{COMPANY}/agents")
+async def list_agents(full: bool = False) -> Any:
+    """List all agents in the active company.
+
+    Returns a compact view by default (id, name, role, status, model,
+    createdAt, updatedAt). Pass full=True to include system prompts,
+    configuration, and all other fields.
+
+    Args:
+        full: If true, return the raw API response instead of the compact view.
+    """
+    result = await _get(f"/companies/{COMPANY}/agents")
+    return result if full else _compact(result, _AGENT_KEYS)
 
 
 @mcp.tool()
@@ -818,24 +893,24 @@ async def invoke_agent_heartbeat(agent_id: str) -> Any:
 async def list_goals(
     limit: int = 50,
     offset: int = 0,
-    summary: bool = False,
+    full: bool = False,
 ) -> Any:
-    """List all strategic goals and projects for the active company.
+    """List all strategic goals for the active company.
+
+    Returns a compact view by default (id, title, status, parentId, level,
+    projectId, updatedAt). Pass full=True for the raw API response.
 
     Args:
         limit: Maximum number of results to return (1–200). Default: 50.
         offset: Number of results to skip for pagination. Default: 0.
-        summary: If true, each goal is projected to 6 key fields only.
-                 Useful when listing many goals to stay within context limits.
+        full: If true, return the raw API response instead of the compact view.
     """
     params: dict[str, Any] = {
         "limit": max(1, min(limit, 200)),
         "offset": max(0, offset),
     }
     result = await _get(f"/companies/{COMPANY}/goals", params)
-    if summary:
-        return _compact(result, _GOAL_SUMMARY_KEYS)
-    return result
+    return result if full else _compact(result, _GOAL_KEYS)
 
 
 @mcp.tool()
@@ -950,9 +1025,17 @@ async def update_goal(
 
 
 @mcp.tool()
-async def list_projects() -> Any:
-    """List all projects in the active company."""
-    return await _get(f"/companies/{COMPANY}/projects")
+async def list_projects(full: bool = False) -> Any:
+    """List all projects in the active company.
+
+    Returns a compact view by default (id, name, status, goalId, createdAt,
+    updatedAt). Pass full=True for the raw API response.
+
+    Args:
+        full: If true, return the raw API response instead of the compact view.
+    """
+    result = await _get(f"/companies/{COMPANY}/projects")
+    return result if full else _compact(result, _PROJECT_KEYS)
 
 
 @mcp.tool()
@@ -973,17 +1056,23 @@ async def get_project(project_id: str) -> Any:
 
 
 @mcp.tool()
-async def list_approvals(status: str = "pending") -> Any:
+async def list_approvals(status: str = "pending", full: bool = False) -> Any:
     """List approval requests in the active company.
+
+    Returns a compact view by default (id, type, status, issueId, goalId,
+    requestedByAgentId, createdAt, updatedAt). Pass full=True for the raw
+    API response.
 
     Args:
         status: Filter by status. Allowed values:
                 pending, approved, rejected, revision_requested.
                 Default: "pending"
+        full: If true, return the raw API response instead of the compact view.
     """
     if status not in APPROVAL_STATUSES:
         return _err(f"Invalid status '{status}'. Allowed: {', '.join(sorted(APPROVAL_STATUSES))}.")
-    return await _get(f"/companies/{COMPANY}/approvals", {"status": status})
+    result = await _get(f"/companies/{COMPANY}/approvals", {"status": status})
+    return result if full else _compact(result, _APPROVAL_KEYS)
 
 
 @mcp.tool()
@@ -1069,15 +1158,18 @@ async def list_activity(
     agent_id: str = "",
     limit: int = 20,
     offset: int = 0,
-    summary: bool = False,
+    full: bool = False,
 ) -> Any:
     """Retrieve the audit trail of recent actions in the active company.
+
+    Returns a compact view by default (id, type, agentId, issueId, goalId,
+    description, createdAt). Pass full=True for the raw API response.
 
     Args:
         agent_id: Filter to a specific agent UUID. Leave empty for all agents.
         limit: Maximum number of entries to return (1–100). Default: 20.
         offset: Number of entries to skip for pagination. Default: 0.
-        summary: If true, each entry is projected to 6 key fields only.
+        full: If true, return the raw API response instead of the compact view.
     """
     params: dict[str, Any] = {
         "limit": max(1, min(limit, 100)),
@@ -1089,9 +1181,7 @@ async def list_activity(
         except ValueError as exc:
             return _err(str(exc))
     result = await _get(f"/companies/{COMPANY}/activity", params)
-    if summary:
-        return _compact(result, _ACTIVITY_SUMMARY_KEYS)
-    return result
+    return result if full else _compact(result, _ACTIVITY_KEYS)
 
 
 # ── ENTRY POINT ────────────────────────────────────────────────────────────────

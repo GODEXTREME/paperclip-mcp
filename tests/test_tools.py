@@ -108,18 +108,24 @@ async def test_list_issues_sends_parent_issue_id_filter(capture: dict[str, Any])
     assert capture["params"]["parentIssueId"] == _UUID_A
 
 
-async def test_list_issues_summary_mode(capture: dict[str, Any]) -> None:
-    capture["_raw"] = [{"id": "x", "title": "t", "extraField": "drop"}]
-
-    async def _fake(method: str, path: str, *, params: Any = None, body: Any = None) -> Any:
-        return capture["_raw"]
-
+async def test_list_issues_compact_by_default(capture: dict[str, Any]) -> None:
     import unittest.mock
 
-    with unittest.mock.patch.object(server, "_request", _fake):
-        result = await server.list_issues(summary=True)
+    raw = [{"id": "x", "title": "t", "extraField": "drop"}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_issues()
     assert isinstance(result, list)
-    assert result[0] == {"id": "x", "title": "t"}
+    assert "extraField" not in result[0]
+    assert result[0]["id"] == "x"
+
+
+async def test_list_issues_full_returns_raw(capture: dict[str, Any]) -> None:
+    import unittest.mock
+
+    raw = [{"id": "x", "title": "t", "extraField": "keep"}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_issues(full=True)
+    assert result[0]["extraField"] == "keep"
 
 
 # ── get_issue ─────────────────────────────────────────────────────────────────
@@ -235,18 +241,15 @@ async def test_list_goals_pagination(capture: dict[str, Any]) -> None:
     assert capture["params"]["offset"] == 50
 
 
-async def test_list_goals_summary_mode(capture: dict[str, Any]) -> None:
-    raw = [{"id": "x", "title": "g", "parentId": None, "status": "active", "extraField": "drop"}]
-
-    async def _fake(method: str, path: str, *, params: Any = None, body: Any = None) -> Any:
-        return raw
-
+async def test_list_goals_compact_by_default(capture: dict[str, Any]) -> None:
     import unittest.mock
 
-    with unittest.mock.patch.object(server, "_request", _fake):
-        result = await server.list_goals(summary=True)
+    raw = [{"id": "x", "title": "g", "status": "active", "extraField": "drop"}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_goals()
     assert isinstance(result, list)
     assert "extraField" not in result[0]
+    assert result[0]["id"] == "x"
 
 
 # ── get_goal ─────────────────────────────────────────────────────────────────
@@ -306,7 +309,56 @@ async def test_update_goal_sends_status(capture: dict[str, Any]) -> None:
     assert capture["body"]["status"] == "completed"
 
 
+# ── list_agents ───────────────────────────────────────────────────────────────
+
+
+async def test_list_agents_compact_by_default(capture: dict[str, Any]) -> None:
+    import unittest.mock
+
+    raw = [{"id": "x", "name": "CEO", "systemPrompt": "huge blob", "config": {}}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_agents()
+    assert isinstance(result, list)
+    assert "systemPrompt" not in result[0]
+    assert "config" not in result[0]
+    assert result[0]["name"] == "CEO"
+
+
+async def test_list_agents_full_returns_raw(capture: dict[str, Any]) -> None:
+    import unittest.mock
+
+    raw = [{"id": "x", "name": "CEO", "systemPrompt": "keep"}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_agents(full=True)
+    assert result[0]["systemPrompt"] == "keep"
+
+
+# ── list_approvals (compact) ──────────────────────────────────────────────────
+
+
+async def test_list_approvals_compact_by_default(capture: dict[str, Any]) -> None:
+    import unittest.mock
+
+    raw = [{"id": "x", "type": "hire", "status": "pending", "metadata": "huge"}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_approvals()
+    assert isinstance(result, list)
+    assert "metadata" not in result[0]
+    assert result[0]["type"] == "hire"
+
+
 # ── list_projects / get_project ───────────────────────────────────────────────
+
+
+async def test_list_projects_compact_by_default(capture: dict[str, Any]) -> None:
+    import unittest.mock
+
+    raw = [{"id": "x", "name": "P1", "description": "long text", "settings": {}}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_projects()
+    assert isinstance(result, list)
+    assert "description" not in result[0]
+    assert result[0]["name"] == "P1"
 
 
 async def test_list_projects_makes_request(capture: dict[str, Any]) -> None:
@@ -333,6 +385,17 @@ async def test_list_comments_rejects_path_injection(no_http: None) -> None:
     for bad in ("../x", "a/b", "a?x=1", ""):
         result = await server.list_comments(issue_id=bad)
         assert result["isError"] is True, f"accepted malicious issue_id: {bad!r}"
+
+
+async def test_list_comments_compact_by_default(capture: dict[str, Any]) -> None:
+    import unittest.mock
+
+    raw = [{"id": "c1", "body": "hello", "authorAgentId": "x", "meta": "drop"}]
+    with unittest.mock.patch.object(server, "_request", side_effect=lambda *a, **k: raw):
+        result = await server.list_comments(issue_id="CY-42")
+    assert isinstance(result, list)
+    assert "meta" not in result[0]
+    assert result[0]["body"] == "hello"
 
 
 async def test_list_comments_makes_request(capture: dict[str, Any]) -> None:
