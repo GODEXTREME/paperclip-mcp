@@ -17,17 +17,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install hatch
-        run: pip install hatch
-
       - name: Determine bump type from conventional commits
         id: bump
         run: |
-          # Find the last tag; if none exists, use the first commit
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
 
           echo "Commits since $LAST_TAG:"
@@ -35,24 +27,61 @@ jobs:
 
           BUMP="patch"
 
-          # Check for breaking changes first (highest priority)
-          if git log "${LAST_TAG}..HEAD" --pretty="%s %b" | grep -qE '(^feat!:|^fix!:|^refactor!:|BREAKING[[:space:]]CHANGE)'; then
+          # Breaking change via ! after type/scope in subject line
+          if git log "${LAST_TAG}..HEAD" --pretty="%s" | grep -qE '^[a-z]+(\(.+\))?!:'; then
             BUMP="major"
-          # Then check for new features
-          elif git log "${LAST_TAG}..HEAD" --pretty="%s" | grep -qE '^feat(\(.+\))?!?:'; then
+          # Breaking change footer (must be "BREAKING CHANGE:" at start of line)
+          elif git log "${LAST_TAG}..HEAD" --pretty="%B" | grep -qE '^BREAKING CHANGE:'; then
+            BUMP="major"
+          # New feature
+          elif git log "${LAST_TAG}..HEAD" --pretty="%s" | grep -qE '^feat(\(.+\))?:'; then
             BUMP="minor"
           fi
 
           echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
           echo "Bump type: $BUMP"
 
-      - name: Bump version with hatch
+      - name: Bump version in pyproject.toml
         id: ver
+        env:
+          BUMP: ${{ steps.bump.outputs.bump }}
         run: |
-          hatch version ${{ steps.bump.outputs.bump }}
-          NEW_VERSION=$(hatch version)
-          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "New version: $NEW_VERSION"
+          python3 - <<'EOF'
+          import os, re, sys
+
+          with open("pyproject.toml") as f:
+              content = f.read()
+
+          m = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', content, re.MULTILINE)
+          if not m:
+              print("ERROR: could not find version in pyproject.toml", file=sys.stderr)
+              sys.exit(1)
+
+          major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+          bump = os.environ["BUMP"]
+
+          if bump == "major":
+              major += 1; minor = 0; patch = 0
+          elif bump == "minor":
+              minor += 1; patch = 0
+          else:
+              patch += 1
+
+          new_version = f"{major}.{minor}.{patch}"
+          new_content = re.sub(
+              r'^version = "\d+\.\d+\.\d+"',
+              f'version = "{new_version}"',
+              content,
+              flags=re.MULTILINE,
+          )
+
+          with open("pyproject.toml", "w") as f:
+              f.write(new_content)
+
+          print(f"Bumped {bump}: {m.group(1)}.{m.group(2)}.{m.group(3)} → {new_version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={new_version}\n")
+          EOF
 
       - name: Commit and tag
         run: |
