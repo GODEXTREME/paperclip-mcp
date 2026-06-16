@@ -5,7 +5,7 @@ paperclip-mcp — MCP server for the Paperclip AI agent orchestration platform.
 Exposes Paperclip's REST API as MCP tools so that AI assistants can manage
 issues, agents, goals, approvals, costs, and activity via natural language.
 
-Documentation: https://github.com/paperclipai/paperclip
+Documentation: https://github.com/godextreme/paperclip-mcp
 MCP spec:      https://modelcontextprotocol.io
 
 Configuration (environment variables):
@@ -51,13 +51,14 @@ from starlette.responses import JSONResponse
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass  # python-dotenv is optional; env vars can be set by the shell
 
 BASE_URL: str = os.environ.get("PAPERCLIP_BASE_URL", "http://localhost:3100/api").rstrip("/")
-API_KEY: str  = os.environ.get("PAPERCLIP_API_KEY", "")
-COMPANY: str  = os.environ.get("PAPERCLIP_COMPANY_ID", "")
+API_KEY: str = os.environ.get("PAPERCLIP_API_KEY", "")
+COMPANY: str = os.environ.get("PAPERCLIP_COMPANY_ID", "")
 MCP_PUBLIC_URL: str = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -189,6 +190,25 @@ async def _request(
                 "Do not retry this request.",
                 status=409,
             )
+        if r.status_code == 401:
+            return _err(
+                "Authentication failed (401): PAPERCLIP_API_KEY is invalid or expired. "
+                "Generate a new key in Paperclip UI → Settings → API Keys.",
+                status=401,
+            )
+        if r.status_code == 403:
+            return _err(
+                "Permission denied (403): this resource is outside the authorization boundary "
+                "of the agent linked to PAPERCLIP_API_KEY. For broad orchestration access, "
+                "generate an API key scoped to a company-admin/CEO agent — see README.",
+                status=403,
+            )
+        if r.status_code == 404:
+            return _err(
+                "Not found (404): the requested resource does not exist. "
+                "Check the ID you provided.",
+                status=404,
+            )
         # Redirects are not followed (see _build_http_client) and are unexpected.
         if r.is_redirect:
             return _err(
@@ -226,7 +246,128 @@ async def _patch(path: str, body: dict[str, Any]) -> Any:
     return await _request("PATCH", path, body=body)
 
 
+# ── Compact projection ─────────────────────────────────────────────────────────
+#
+# All list_* tools apply a compact projection by default: only the most useful
+# fields are returned. Pass full=True to get the raw API response.
+# (200 issues raw ≈ 580 KB; compact ≈ 30 KB — ~20× smaller.)
+
+_ISSUE_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "identifier",
+        "title",
+        "status",
+        "priority",
+        "assigneeAgentId",
+        "projectId",
+        "goalId",
+        "parentId",
+        "labels",
+        "updatedAt",
+    }
+)
+_GOAL_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "title",
+        "status",
+        "parentId",
+        "level",
+        "projectId",
+        "updatedAt",
+    }
+)
+_ACTIVITY_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "type",
+        "agentId",
+        "issueId",
+        "goalId",
+        "description",
+        "createdAt",
+    }
+)
+_AGENT_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "name",
+        "role",
+        "status",
+        "model",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_APPROVAL_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "type",
+        "status",
+        "issueId",
+        "goalId",
+        "requestedByAgentId",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_PROJECT_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "name",
+        "status",
+        "goalId",
+        "createdAt",
+        "updatedAt",
+    }
+)
+_COMMENT_KEYS: frozenset[str] = frozenset(
+    {
+        "id",
+        "body",
+        "authorAgentId",
+        "createdAt",
+        "updatedAt",
+    }
+)
+
+# Envelope keys Paperclip may wrap list payloads in (checked in order).
+_ENVELOPE_KEYS = (
+    "data",
+    "issues",
+    "goals",
+    "agents",
+    "approvals",
+    "projects",
+    "comments",
+    "activity",
+    "results",
+    "items",
+)
+
+
+def _compact(raw: Any, keys: frozenset[str]) -> Any:
+    """Project each item in a list (or paginated envelope) to the given key set."""
+    if isinstance(raw, dict) and raw.get("isError"):
+        return raw
+
+    def _proj(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {k: v for k, v in item.items() if k in keys}
+        return item
+
+    if isinstance(raw, list):
+        return [_proj(i) for i in raw]
+    if isinstance(raw, dict):
+        for k in _ENVELOPE_KEYS:
+            if k in raw and isinstance(raw[k], list):
+                return {**raw, k: [_proj(i) for i in raw[k]]}
+    return raw
+
+
 # ── Startup validation ─────────────────────────────────────────────────────────
+
 
 def _mask_key(key: str) -> str:
     """Render an API key safe for logs: only the last 4 characters survive."""
@@ -246,10 +387,14 @@ def _is_private_host(host: str) -> bool:
 
 def _validate_config() -> None:
     """Fail fast with actionable error messages if required env vars are missing."""
-    missing = [k for k, v in {
-        "PAPERCLIP_API_KEY": API_KEY,
-        "PAPERCLIP_COMPANY_ID": COMPANY,
-    }.items() if not v]
+    missing = [
+        k
+        for k, v in {
+            "PAPERCLIP_API_KEY": API_KEY,
+            "PAPERCLIP_COMPANY_ID": COMPANY,
+        }.items()
+        if not v
+    ]
     if missing:
         log.error("Missing required environment variables: %s", ", ".join(missing))
         log.error(
@@ -267,9 +412,7 @@ def _validate_config() -> None:
         )
         sys.exit(1)
     if not BASE_URL.startswith(("http://", "https://")):
-        log.error(
-            "PAPERCLIP_BASE_URL must start with http:// or https:// (got: %s)", BASE_URL
-        )
+        log.error("PAPERCLIP_BASE_URL must start with http:// or https:// (got: %s)", BASE_URL)
         sys.exit(1)
     host = urllib.parse.urlsplit(BASE_URL).hostname or ""
     if BASE_URL.startswith("http://") and not _is_private_host(host):
@@ -304,7 +447,7 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 OAUTH_CLIENT_ID = "paperclip-mcp-client"
 
 
-class PaperclipAuthProvider(InMemoryOAuthProvider):
+class PaperclipAuthProvider(InMemoryOAuthProvider):  # type: ignore[misc]
     """Combined OAuth 2.0 + static bearer token auth provider.
 
     When MCP_PUBLIC_URL is set, use this instead of StaticBearerVerifier:
@@ -344,7 +487,7 @@ class PaperclipAuthProvider(InMemoryOAuthProvider):
         )
 
 
-class StaticBearerVerifier(TokenVerifier):
+class StaticBearerVerifier(TokenVerifier):  # type: ignore[misc]
     """FastMCP TokenVerifier backed by a single static secret (MCP_AUTH_TOKEN).
 
     Every HTTP request must carry `Authorization: Bearer <token>`; anything
@@ -389,15 +532,24 @@ async def _healthz(_request: Request) -> JSONResponse:
 
 # ── ISSUES ─────────────────────────────────────────────────────────────────────
 
+
 @mcp.tool()
 async def list_issues(
     status: str = "todo,in_progress",
     assignee_agent_id: str = "",
     project_id: str = "",
+    goal_id: str = "",
+    parent_issue_id: str = "",
     label: str = "",
     limit: int = 50,
+    offset: int = 0,
+    full: bool = False,
 ) -> Any:
     """List issues (tasks) in the active company.
+
+    Returns a compact view by default (id, identifier, title, status, priority,
+    assigneeAgentId, projectId, goalId, parentId, labels, updatedAt). Pass
+    full=True to receive the complete raw API response.
 
     Args:
         status: Comma-separated issue statuses to include.
@@ -405,8 +557,12 @@ async def list_issues(
                 Default: "todo,in_progress"
         assignee_agent_id: UUID of the agent to filter by. Leave empty for all agents.
         project_id: UUID of the project to filter by. Leave empty for all projects.
+        goal_id: UUID of the goal to filter by. Leave empty for all goals.
+        parent_issue_id: UUID of the parent issue to list subtasks for. Leave empty for all.
         label: Label name to filter by. Leave empty to skip label filtering.
         limit: Maximum number of results to return (1–200). Default: 50.
+        offset: Number of results to skip for pagination. Default: 0.
+        full: If true, return the raw API response instead of the compact view.
     """
     statuses = [s.strip() for s in status.split(",") if s.strip()]
     invalid = sorted(set(statuses) - ISSUE_STATUSES)
@@ -415,14 +571,30 @@ async def list_issues(
             f"Invalid status filter '{status}'. "
             f"Allowed (comma-separated): {', '.join(sorted(ISSUE_STATUSES))}."
         )
-    params: dict[str, Any] = {"status": ",".join(statuses), "limit": max(1, min(limit, 200))}
-    if assignee_agent_id:
-        params["assigneeAgentId"] = assignee_agent_id
-    if project_id:
-        params["projectId"] = project_id
+    params: dict[str, Any] = {
+        "status": ",".join(statuses),
+        "limit": max(1, min(limit, 200)),
+        "offset": max(0, offset),
+    }
+    try:
+        agent_uuid = _opt_uuid(assignee_agent_id, "assignee_agent_id")
+        if agent_uuid is not None:
+            params["assigneeAgentId"] = agent_uuid
+        proj_uuid = _opt_uuid(project_id, "project_id")
+        if proj_uuid is not None:
+            params["projectId"] = proj_uuid
+        goal_uuid = _opt_uuid(goal_id, "goal_id")
+        if goal_uuid is not None:
+            params["goalId"] = goal_uuid
+        parent_uuid = _opt_uuid(parent_issue_id, "parent_issue_id")
+        if parent_uuid is not None:
+            params["parentIssueId"] = parent_uuid
+    except ValueError as exc:
+        return _err(str(exc))
     if label:
         params["label"] = label
-    return await _get(f"/companies/{COMPANY}/issues", params)
+    result = await _get(f"/companies/{COMPANY}/issues", params)
+    return result if full else _compact(result, _ISSUE_KEYS)
 
 
 @mcp.tool()
@@ -448,6 +620,9 @@ async def create_issue(
     parent_issue_id: str = "",
     goal_id: str = "",
     priority: str = "medium",
+    status: str = "",
+    labels: str = "",
+    work_mode: str = "",
 ) -> Any:
     """Create a new issue (task) and optionally assign it to an agent.
 
@@ -463,14 +638,28 @@ async def create_issue(
         goal_id: UUID of the goal this issue should be linked to. Leave empty to inherit
                  the goal from the project (if any).
         priority: Task priority — urgent, high, medium, or low. Default: medium.
+        status: Initial status — todo, in_progress, blocked, done, or cancelled.
+                Leave empty for the API default (usually "todo").
+        labels: Comma-separated label names to attach (e.g. "bug,backend"). Leave empty
+                for no labels.
+        work_mode: Optional work mode hint for the agent (e.g. "autonomous", "supervised").
+                   Leave empty for the API default.
     """
     if priority not in ISSUE_PRIORITIES:
         return _err(
             f"Invalid priority '{priority}'. Allowed: {', '.join(sorted(ISSUE_PRIORITIES))}."
         )
+    if status and status not in ISSUE_STATUSES:
+        return _err(f"Invalid status '{status}'. Allowed: {', '.join(sorted(ISSUE_STATUSES))}.")
     body: dict[str, Any] = {"title": title, "priority": priority}
     if description:
         body["description"] = description
+    if status:
+        body["status"] = status
+    if labels:
+        body["labels"] = [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
+    if work_mode:
+        body["workMode"] = work_mode
     try:
         for field, value in (
             ("assigneeAgentId", assignee_agent_id),
@@ -497,8 +686,13 @@ async def update_issue(
     project_id: str = "",
     parent_issue_id: str = "",
     goal_id: str = "",
+    labels: str = "",
 ) -> Any:
     """Update an existing issue. Only fields you provide are changed.
+
+    To unlink a relationship (goal, project, parent), pass the literal string
+    "null" as the value (e.g. goal_id="null"). This sends JSON null to the API,
+    clearing the link while leaving all other fields untouched.
 
     Args:
         issue_id: Issue UUID or identifier (e.g. "CY-42").
@@ -508,9 +702,12 @@ async def update_issue(
                 Leave empty to keep current.
         assignee_agent_id: New agent UUID. Leave empty to keep current assignee.
         priority: New priority — urgent, high, medium, or low. Leave empty to keep current.
-        project_id: Move the issue to this project UUID. Leave empty to keep current project.
-        parent_issue_id: Re-parent the issue under this issue UUID. Leave empty to keep current.
-        goal_id: Link the issue to this goal UUID. Leave empty to keep current goal.
+        project_id: Move the issue to this project UUID, or "null" to remove from project.
+        parent_issue_id: Re-parent the issue under this issue UUID, or "null" to make
+                         it a top-level issue.
+        goal_id: Link to this goal UUID, or "null" to unlink from current goal.
+        labels: Comma-separated label names to set (replaces all existing labels).
+                Leave empty to keep current labels.
     """
     try:
         ref = _issue_ref(issue_id)
@@ -523,33 +720,39 @@ async def update_issue(
         body["description"] = description
     if status:
         if status not in ISSUE_STATUSES:
-            return _err(
-                f"Invalid status '{status}'. Allowed: {', '.join(sorted(ISSUE_STATUSES))}."
-            )
+            return _err(f"Invalid status '{status}'. Allowed: {', '.join(sorted(ISSUE_STATUSES))}.")
         body["status"] = status
     if assignee_agent_id:
-        body["assigneeAgentId"] = assignee_agent_id
+        try:
+            body["assigneeAgentId"] = _uuid_param(assignee_agent_id, "assignee_agent_id")
+        except ValueError as exc:
+            return _err(str(exc))
     if priority:
         if priority not in ISSUE_PRIORITIES:
             return _err(
                 f"Invalid priority '{priority}'. Allowed: {', '.join(sorted(ISSUE_PRIORITIES))}."
             )
         body["priority"] = priority
+    if labels:
+        body["labels"] = [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
     try:
         for field, value in (
             ("projectId", project_id),
             ("parentIssueId", parent_issue_id),
             ("goalId", goal_id),
         ):
-            canonical = _opt_uuid(value, field)
-            if canonical is not None:
-                body[field] = canonical
+            if value == "null":
+                body[field] = None
+            else:
+                canonical = _opt_uuid(value, field)
+                if canonical is not None:
+                    body[field] = canonical
     except ValueError as exc:
         return _err(str(exc))
     if not body:
         return _err(
             "No fields to update. Provide at least one of: title, description, status, "
-            "assignee_agent_id, priority, project_id, parent_issue_id, goal_id."
+            "assignee_agent_id, priority, project_id, parent_issue_id, goal_id, labels."
         )
     return await _patch(f"/issues/{ref}", body)
 
@@ -612,12 +815,41 @@ async def comment_on_issue(
     return await _post(f"/issues/{ref}/comments", payload)
 
 
+@mcp.tool()
+async def list_comments(issue_id: str, full: bool = False) -> Any:
+    """List all comments on an issue, in chronological order.
+
+    Returns a compact view by default (id, body, authorAgentId, createdAt,
+    updatedAt). Pass full=True for the raw API response.
+
+    Args:
+        issue_id: Issue UUID or human-readable identifier (e.g. "CY-42").
+        full: If true, return the raw API response instead of the compact view.
+    """
+    try:
+        ref = _issue_ref(issue_id)
+    except ValueError as exc:
+        return _err(str(exc))
+    result = await _get(f"/issues/{ref}/comments")
+    return result if full else _compact(result, _COMMENT_KEYS)
+
+
 # ── AGENTS ─────────────────────────────────────────────────────────────────────
 
+
 @mcp.tool()
-async def list_agents() -> Any:
-    """List all agents in the active company with their name, role, status, and config."""
-    return await _get(f"/companies/{COMPANY}/agents")
+async def list_agents(full: bool = False) -> Any:
+    """List all agents in the active company.
+
+    Returns a compact view by default (id, name, role, status, model,
+    createdAt, updatedAt). Pass full=True to include system prompts,
+    configuration, and all other fields.
+
+    Args:
+        full: If true, return the raw API response instead of the compact view.
+    """
+    result = await _get(f"/companies/{COMPANY}/agents")
+    return result if full else _compact(result, _AGENT_KEYS)
 
 
 @mcp.tool()
@@ -656,10 +888,43 @@ async def invoke_agent_heartbeat(agent_id: str) -> Any:
 
 # ── GOALS ──────────────────────────────────────────────────────────────────────
 
+
 @mcp.tool()
-async def list_goals() -> Any:
-    """List all strategic goals and projects for the active company."""
-    return await _get(f"/companies/{COMPANY}/goals")
+async def list_goals(
+    limit: int = 50,
+    offset: int = 0,
+    full: bool = False,
+) -> Any:
+    """List all strategic goals for the active company.
+
+    Returns a compact view by default (id, title, status, parentId, level,
+    projectId, updatedAt). Pass full=True for the raw API response.
+
+    Args:
+        limit: Maximum number of results to return (1–200). Default: 50.
+        offset: Number of results to skip for pagination. Default: 0.
+        full: If true, return the raw API response instead of the compact view.
+    """
+    params: dict[str, Any] = {
+        "limit": max(1, min(limit, 200)),
+        "offset": max(0, offset),
+    }
+    result = await _get(f"/companies/{COMPANY}/goals", params)
+    return result if full else _compact(result, _GOAL_KEYS)
+
+
+@mcp.tool()
+async def get_goal(goal_id: str) -> Any:
+    """Get the full details of a single goal.
+
+    Args:
+        goal_id: Goal UUID.
+    """
+    try:
+        ref = _uuid_param(goal_id, "goal_id")
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _get(f"/goals/{ref}")
 
 
 @mcp.tool()
@@ -707,21 +972,24 @@ async def update_goal(
     goal_id: str,
     title: str = "",
     description: str = "",
+    status: str = "",
     parent_id: str = "",
     level: str = "",
 ) -> Any:
-    """Update an existing goal's title, description, parent, or level.
+    """Update an existing goal's title, description, status, parent, or level.
 
     Pass parent_id to nest this goal under another goal (e.g. attach a project
-    goal under the company mission) so results roll up the hierarchy. Only the
-    fields you provide are changed.
+    goal under the company mission) so results roll up the hierarchy. Pass
+    parent_id="null" to detach from the current parent and make it a top-level
+    goal. Only the fields you provide are changed.
 
     Args:
         goal_id: Goal UUID.
         title: New title. Leave empty to keep current.
         description: New description. Leave empty to keep current.
-        parent_id: UUID of the new parent goal to nest this goal under. Leave empty to
-                   keep the current parent.
+        status: New goal status. Leave empty to keep current.
+        parent_id: UUID of the new parent goal, or "null" to unlink from current parent.
+                   Leave empty to keep the current parent.
         level: New hierarchy level (values defined by the Paperclip API,
                e.g. company/objective/project/task). Leave empty to keep current.
     """
@@ -734,38 +1002,77 @@ async def update_goal(
         body["title"] = title
     if description:
         body["description"] = description
+    if status:
+        body["status"] = status
     if level.strip():
         body["level"] = level.strip()
-    try:
-        parent = _opt_uuid(parent_id, "parent_id")
-        if parent is not None:
-            body["parentId"] = parent
-    except ValueError as exc:
-        return _err(str(exc))
+    if parent_id == "null":
+        body["parentId"] = None
+    elif parent_id:
+        try:
+            body["parentId"] = _uuid_param(parent_id, "parent_id")
+        except ValueError as exc:
+            return _err(str(exc))
     if not body:
         return _err(
             "No fields to update. Provide at least one of: "
-            "title, description, parent_id, level."
+            "title, description, status, parent_id, level."
         )
     return await _patch(f"/goals/{ref}", body)
 
 
-# ── APPROVALS ──────────────────────────────────────────────────────────────────
+# ── PROJECTS ───────────────────────────────────────────────────────────────────
+
 
 @mcp.tool()
-async def list_approvals(status: str = "pending") -> Any:
+async def list_projects(full: bool = False) -> Any:
+    """List all projects in the active company.
+
+    Returns a compact view by default (id, name, status, goalId, createdAt,
+    updatedAt). Pass full=True for the raw API response.
+
+    Args:
+        full: If true, return the raw API response instead of the compact view.
+    """
+    result = await _get(f"/companies/{COMPANY}/projects")
+    return result if full else _compact(result, _PROJECT_KEYS)
+
+
+@mcp.tool()
+async def get_project(project_id: str) -> Any:
+    """Get the full details of a single project.
+
+    Args:
+        project_id: Project UUID.
+    """
+    try:
+        ref = _uuid_param(project_id, "project_id")
+    except ValueError as exc:
+        return _err(str(exc))
+    return await _get(f"/projects/{ref}")
+
+
+# ── APPROVALS ──────────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def list_approvals(status: str = "pending", full: bool = False) -> Any:
     """List approval requests in the active company.
+
+    Returns a compact view by default (id, type, status, issueId, goalId,
+    requestedByAgentId, createdAt, updatedAt). Pass full=True for the raw
+    API response.
 
     Args:
         status: Filter by status. Allowed values:
                 pending, approved, rejected, revision_requested.
                 Default: "pending"
+        full: If true, return the raw API response instead of the compact view.
     """
     if status not in APPROVAL_STATUSES:
-        return _err(
-            f"Invalid status '{status}'. Allowed: {', '.join(sorted(APPROVAL_STATUSES))}."
-        )
-    return await _get(f"/companies/{COMPANY}/approvals", {"status": status})
+        return _err(f"Invalid status '{status}'. Allowed: {', '.join(sorted(APPROVAL_STATUSES))}.")
+    result = await _get(f"/companies/{COMPANY}/approvals", {"status": status})
+    return result if full else _compact(result, _APPROVAL_KEYS)
 
 
 @mcp.tool()
@@ -825,6 +1132,7 @@ async def request_approval_revision(approval_id: str, comment: str) -> Any:
 
 # ── COSTS & MONITORING ─────────────────────────────────────────────────────────
 
+
 @mcp.tool()
 async def get_cost_summary() -> Any:
     """Get aggregate token usage and spend for the active company this billing period.
@@ -849,20 +1157,35 @@ async def get_dashboard() -> Any:
 async def list_activity(
     agent_id: str = "",
     limit: int = 20,
+    offset: int = 0,
+    full: bool = False,
 ) -> Any:
     """Retrieve the audit trail of recent actions in the active company.
+
+    Returns a compact view by default (id, type, agentId, issueId, goalId,
+    description, createdAt). Pass full=True for the raw API response.
 
     Args:
         agent_id: Filter to a specific agent UUID. Leave empty for all agents.
         limit: Maximum number of entries to return (1–100). Default: 20.
+        offset: Number of entries to skip for pagination. Default: 0.
+        full: If true, return the raw API response instead of the compact view.
     """
-    params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+    params: dict[str, Any] = {
+        "limit": max(1, min(limit, 100)),
+        "offset": max(0, offset),
+    }
     if agent_id:
-        params["agentId"] = agent_id
-    return await _get(f"/companies/{COMPANY}/activity", params)
+        try:
+            params["agentId"] = _uuid_param(agent_id, "agent_id")
+        except ValueError as exc:
+            return _err(str(exc))
+    result = await _get(f"/companies/{COMPANY}/activity", params)
+    return result if full else _compact(result, _ACTIVITY_KEYS)
 
 
 # ── ENTRY POINT ────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     """CLI entry point — invoked via `paperclip-mcp` or `python -m paperclip_mcp`."""

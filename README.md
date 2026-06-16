@@ -10,9 +10,10 @@ Exposes Paperclip's REST API as [Model Context Protocol](https://modelcontextpro
 
 | Category | Tools |
 |---|---|
-| **Issues** | `list_issues` · `get_issue` · `create_issue` · `update_issue` · `checkout_issue` · `release_issue` · `comment_on_issue` |
+| **Issues** | `list_issues` · `get_issue` · `create_issue` · `update_issue` · `checkout_issue` · `release_issue` · `comment_on_issue` · `list_comments` |
 | **Agents** | `list_agents` · `get_agent` · `invoke_agent_heartbeat` |
-| **Goals** | `list_goals` · `create_goal` · `update_goal` |
+| **Goals** | `list_goals` · `get_goal` · `create_goal` · `update_goal` |
+| **Projects** | `list_projects` · `get_project` |
 | **Approvals** | `list_approvals` · `approve` · `reject` · `request_approval_revision` |
 | **Monitoring** | `get_cost_summary` · `get_dashboard` · `list_activity` |
 
@@ -24,7 +25,24 @@ Goals and issues can be organized into a hierarchy so work traces back to the mi
   **`level`**. `create_goal` also accepts **`project_id`**.
 - `create_issue` / `update_issue` accept **`goal_id`**, **`project_id`** and
   **`parent_issue_id`** — link an issue to a specific goal, move it between projects, or
-  re-parent it. (`create_issue` already validates `priority`.)
+  re-parent it.
+
+To **unlink** a relationship, pass the literal string `"null"` as the value:
+
+```
+update_issue(issue_id="CY-42", goal_id="null")     # removes goal link
+update_goal(goal_id="...", parent_id="null")        # makes goal top-level
+```
+
+### Pagination & compact mode
+
+`list_issues`, `list_goals`, and `list_activity` accept **`limit`** and **`offset`** for
+cursor-free pagination. Pass **`summary=True`** to project each item down to its most-used
+fields — useful when listing large collections to stay within context limits:
+
+```
+list_issues(limit=200, offset=0, summary=True)   # ~580 KB → ~30 KB
+```
 
 All id parameters are validated as UUIDs before the request is sent.
 
@@ -44,7 +62,7 @@ All id parameters are validated as UUIDs before the request is sent.
 
 ```bash
 # Clone the repo
-git clone https://github.com/wizarck/paperclip-mcp
+git clone https://github.com/godextreme/paperclip-mcp
 cd paperclip-mcp
 
 # Install (editable for local use, or drop -e for production)

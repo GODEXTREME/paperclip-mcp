@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "paperclip-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for the Paperclip AI agent orchestration platform"
 readme = "README.md"
 license = { text = "MIT" }
@@ -37,9 +37,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage   = "https://github.com/wizarck/paperclip-mcp"
-Repository = "https://github.com/wizarck/paperclip-mcp"
-Issues     = "https://github.com/wizarck/paperclip-mcp/issues"
+Homepage   = "https://github.com/godextreme/paperclip-mcp"
+Repository = "https://github.com/godextreme/paperclip-mcp"
+Issues     = "https://github.com/godextreme/paperclip-mcp/issues"
 
 [project.scripts]
 paperclip-mcp = "paperclip_mcp.server:main"
