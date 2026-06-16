@@ -49,7 +49,7 @@
       "list_projects", "get_project",
       "list_approvals", "approve", "reject", "request_approval_revision",
       "get_cost_summary", "get_dashboard", "list_activity",
-      "list_comments"
+      "list_comments", "get_server_info"
     ]
   }
 }
